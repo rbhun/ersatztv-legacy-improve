@@ -1,0 +1,264 @@
+# ErsatzTV Sequential Schedule — "Movies"
+#
+#   09:00  family films — nothing 12+
+#   14:00  daytime films — all genres bar horror, nothing 16+
+#   18:00  comedy — nothing 18+
+#   22:00  prime — drama and thriller, then action; unrestricted
+#   late   horror and mystery, through to 09:00
+#
+# Uses `count` rather than `pad_until` for the evening dayparts, so films always play whole.
+# Start times therefore drift from the nominal daypart times, which is how real movie channels
+# behave. A short-film pad realigns the day before prime time.
+#
+# ─── EVERY QUERY IS SCOPED BY library_name. THIS IS NOT OPTIONAL ──────────────
+# Plex types two junk libraries as movies: Demos (2 LG 4K demo loops) and Other videos
+# (42 drone clips, GoPro files, Zoom recordings, home video). Unscoped, SHORT_FILMS in
+# particular would happily schedule a 90-minute Zoom call. See main.yml for the full note.
+#
+# Counts below are from ersatztv/audit/library-audit.txt — 786 films in the Movies library,
+# 775 of which carry at least one genre.
+
+# ─── THE AGE LADDER ──────────────────────────────────────────────────────────
+# Four steps, the same on every channel, machine-checked by scripts/check_watershed.py:
+#
+#   06:00-14:00   nothing 12+     ceiling G, hu/KN, hu/6             37 films
+#   14:00-18:00   nothing 16+     ceiling hu/14, PG-13              299 films
+#   18:00-22:00   nothing 18+     ceiling hu/16                     169 + 125 films
+#   22:00-06:00   anything        hu/18, R                          417 + 255 + 59 films
+#
+# Splitting the daytime at 14:00 is what makes the under-12 pool workable. 37 films is about
+# 66 hours, which cycled weekly against the old nine-hour daytime block; against five hours a
+# day it lasts closer to a fortnight.
+#
+# ─── EVERY STEP IS AN ALLOW-LIST, NEVER AN EXCLUSION ──────────────────────────
+# `NOT content_rating:"hu/18"` is TRUE for a film with no rating, and 38 films here are
+# unrated or "Not Rated". Unknown must mean excluded, so each tier enumerates what it permits
+# and nothing else. That also sidesteps the inconsistent values in this library: `hu/16`
+# appears once with a trailing space and four times as `hu/16 éven aluliak számára nem
+# ajánlott`, all three spellings are listed in the 18:00 tier, and an allow-list never has to
+# enumerate the unsafe side where a missed variant would be a safety hole rather than a gap.
+#
+# `12`, `hu/PG-13` and `TV-G` each appear on a single film. They are included because they are
+# unambiguous. `Passed` (1 film, an obsolete MPAA code) is left out and so never airs here.
+
+content:
+  # 37 films, and no genre filter — at this rating they are family films by definition, so
+  # restricting the genre would only shrink the pool. Animation arrives on rating alone, which
+  # is the right mechanism: 24 of the library's 26 animated films sit in the *Movies* library
+  # and only 2 in Animated, so scoping by library would have missed almost all of them.
+  # Toy Story 3 and Mufasa are hu/12 and so belong to the 14:00 block, not this one.
+  - search:
+    key: "FAMILY_FILMS"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 400] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6))"
+    order: shuffle
+
+  # FAMILY_FILMS at 60-100 minutes. Only the overrun at the next boundary draws from it.
+  - search:
+    key: "FAMILY_SHORT"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 100] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6))"
+    order: shuffle
+
+  # 299 films. All genres bar horror, still under the 16 ceiling. Horror is held back even
+  # when lightly rated, because an hu/12 horror film is still horror at three in the afternoon.
+  - search:
+    key: "DAYTIME_FILMS"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 400] NOT genre:horror AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\")"
+    order: shuffle
+
+  # DAYTIME_FILMS at 60-100 minutes. Only the overrun at the next boundary draws from it.
+  - search:
+    key: "DAYTIME_SHORT"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 100] NOT genre:horror AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\")"
+    order: shuffle
+
+  # 169 films, under the 18 ceiling.
+  - search:
+    key: "COMEDY"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND genre:comedy AND minutes:[60 TO 400] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\" OR content_rating:(hu AND 16))"
+    order: shuffle
+
+  # 125 films. Used only to realign the clock before 22:00, where a 150-minute epic would
+  # overrun. Under the 18 ceiling, since this block runs before 22:00.
+  - search:
+    key: "SHORT_FILMS"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 100] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\" OR content_rating:(hu AND 16))"
+    order: shuffle
+
+  # 417 films — drama is the dominant genre at 288, so prime time has the deepest pool.
+  # 22:00 onward is unrestricted, which is what gives the 136 hu/18 films and the 39 R-rated
+  # films somewhere to air. Do not add a ceiling to the three sources below.
+  - search:
+    key: "PRIME_DRAMA"
+    query: "type:movie AND library_name:\"Movies\" AND (genre:drama OR genre:thriller OR genre:crime) AND minutes:[60 TO 400]"
+    order: shuffle
+
+  # 255 films.
+  - search:
+    key: "ACTION"
+    query: "type:movie AND library_name:\"Movies\" AND (genre:action OR genre:adventure) AND minutes:[60 TO 400]"
+    order: shuffle
+
+  # 242 films, unrestricted. This block exists because the 18:00 COMEDY source is capped at
+  # under-18, which on its own stranded 36 adult comedies — Blazing Saddles, Tootsie, Poor
+  # Things, Me Myself & Irene, the stand-up specials. Every genre-scoped source at 22:00 is
+  # drama, action, horror or mystery, so comedy had no unrestricted home at all.
+  - search:
+    key: "LATE_COMEDY"
+    query: "type:movie AND library_name:\"Movies\" AND genre:comedy AND minutes:[60 TO 400]"
+    order: shuffle
+
+  # 779 films — deliberately a catch-all: both film libraries, no genre requirement, no
+  # rating ceiling.
+  # It fills the small hours and, more importantly, it is the backstop that guarantees no
+  # film in the library is unschedulable. Anything with a missing or odd genre, or a rating
+  # this repo does not recognise, reaches the channel here and nowhere else. Do not add a
+  # genre filter to it.
+  - search:
+    key: "LATE_ANY"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 400]"
+    order: shuffle
+
+  # 59 films. Thin, so late night repeats sooner than the other dayparts.
+  - search:
+    key: "LATE_GENRE"
+    query: "type:movie AND library_name:\"Movies\" AND (genre:horror OR genre:mystery) AND minutes:[60 TO 400]"
+    order: shuffle
+
+reset:
+  - wait_until: "09:00"
+    tomorrow: false
+    rewind_on_reset: true
+
+playout:
+  - wait_until: "09:00"
+    tomorrow: false
+
+  # ─── NO GAPS: HOW EVERY BOUNDARY IS CLOSED ───────────────────────────────────
+  # User rule, 2026-11-19: no gaps and no cartoon filler. Each daypart boundary T is two
+  # instructions:
+  #
+  #   1. `pad_until` T, `trim: false`: whole items from the ending block, as many as fit.
+  #   2. `pad_until` T minus 15 minutes from the same block, `stop_before_end: false`.
+  #
+  # If step 1 leaves 15 minutes or less, step 2 is a no-op (`tomorrow: false` and its time
+  # has passed) and the next block starts up to 15 minutes early. If more is left, step 2 adds
+  # whole items until the clock passes T minus 15, so its last item runs over T and the next
+  # block starts late. The overrun always comes from the earlier, stricter block, so the only
+  # ladder exposure is the early start, bounded at 15 minutes; scripts/check_watershed.py
+  # allows exactly that.
+  #
+  # Shorter is preferred for the overrun, so the film blocks overrun from FAMILY_SHORT and
+  # DAYTIME_SHORT (60-100 minutes) rather than the full pools; 22:00 already uses SHORT_FILMS.
+  #
+  # `stop_before_end` is missing from the ErsatzTV docs but is a field of every `pad_until`
+  # (default true). When false, items are added until the target is reached or passed instead
+  # of only while they fit.
+  #
+  # The day-start boundary is the exception. The FAMILY_FILMS block is the stricter one, so rather
+  # than another late-night title, the last instruction of the day starts the FAMILY_FILMS block
+  # early and pads to 09:00 exactly. It must reach 09:00: `repeat` leads to
+  # `wait_until: "09:00"`, which would leave any shortfall off air.
+  #
+  # No `fallback` anywhere. It loops ONE item over the gap, and the next engine failed when a
+  # viewer joined deep into the loop (2026-11-18).
+  - pad_until: "14:00"
+    tomorrow: false
+    content: "FAMILY_FILMS"
+    trim: false
+    discard_attempts: 5
+
+  - pad_until: "13:45"
+    tomorrow: false
+    content: "FAMILY_SHORT"
+    stop_before_end: false
+
+  - pad_until: "18:00"
+    tomorrow: false
+    content: "DAYTIME_FILMS"
+    trim: false
+    discard_attempts: 5
+
+  - pad_until: "17:45"
+    tomorrow: false
+    content: "DAYTIME_SHORT"
+    stop_before_end: false
+
+  # 18:00 — the ceiling rises from 14 to 16.
+  - count: 1
+    content: "COMEDY"
+
+  # Realign to 22:00 with short films. trim:false keeps them intact; discard_attempts looks
+  # for one that fits the remaining gap before giving up. An under-18 film overrunning 22:00
+  # breaks nothing, so trimming is unnecessary here.
+  - pad_until: "22:00"
+    tomorrow: false
+    content: "SHORT_FILMS"
+    trim: false
+    discard_attempts: 5
+
+  - pad_until: "21:45"
+    tomorrow: false
+    content: "SHORT_FILMS"
+    stop_before_end: false
+
+  # 22:00 — unrestricted from here. Five films carry the night.
+  - count: 1
+    content: "PRIME_DRAMA"
+
+  - count: 1
+    content: "ACTION"
+
+  - count: 1
+    content: "LATE_COMEDY"
+
+  - count: 1
+    content: "LATE_GENRE"
+
+  # Crosses midnight, so `tomorrow: true` is required. The catch-all backstop.
+  - pad_until: "09:00"
+    tomorrow: true
+    content: "LATE_ANY"
+    discard_attempts: 3
+    trim: false
+
+  - pad_until: "09:00"
+    tomorrow: false
+    content: "FAMILY_FILMS"
+    stop_before_end: false
+
+  - repeat: true
+
+# ─── OPTIONAL: PUT THE BEST FILMS IN PRIME TIME ───────────────────────────────
+# ErsatzTV's search index has NO rating field — not critic, audience, or personal. Its
+# complete field reference lists `content_rating` and nothing else. So `audience_rating:>8`
+# is not expressible here, however much you might want it.
+#
+# Plex does have the data, with good coverage: audience ratings on 776 of 790 films (98%),
+# critic on 714 (90%), median 7.9 and 7.7 respectively. The way to use it is indirectly,
+# because `collection` IS a searchable field in ErsatzTV and Plex collections sync across:
+#
+#   1. In Plex, Movies library -> create a SMART collection, filter Audience Rating >= 8.
+#      That is 377 films. (>= 9 gives 175; critic >= 8 gives 322.)
+#   2. Name it something stable, e.g. "Top Rated".
+#   3. Let ErsatzTV scan, then add here:
+#
+#        - search:
+#          key: "TOP_RATED"
+#          query: "type:movie AND library_name:\"Movies\" AND collection:\"Top Rated\""
+#          order: shuffle
+#
+#   4. Point the 22:00 instruction at TOP_RATED instead of PRIME_DRAMA.
+#
+# Do not wire this up before the Plex collection exists and has synced — an empty content
+# source is dead air.
+#
+# ─── 11 FILMS ARE INVISIBLE TO THIS CHANNEL ───────────────────────────────────
+# These carry no genre in the Movies library, so the genre-scoped queries cannot reach them.
+# DAYTIME_FILMS has no genre requirement and so picks up any that are rated under 16:
+#   9 (2009) · A tanu (1970) · All That Jazz (1979) · Bottle Rocket (1996) · Gia (1998)
+#   Home (2009) · Robin Hood (2010) · The Beach (2000) · Imax Extreme Adventure Grand
+#   Canyon (2018) · Fogd a P Nzt S Fuss Sample (1969) · Fr Di S B Ni Leal Z a Fut L Z 1981
+#   Web DL Robzombi
+# Several are real films worth airing. Fix their metadata in Plex (Match / Edit) and they
+# join the genre rotation automatically. The last two are raw release names that never matched
+# properly — the second also appears in the Animated library, so it is imported twice.

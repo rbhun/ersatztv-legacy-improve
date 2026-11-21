@@ -1,0 +1,112 @@
+# English-preferring stream selector, with English subtitles forced on wherever they exist.
+#
+# Deploy to:  /opt/ersatztv/config/scripts/channel-stream-selectors/stream-selector-en.yml
+# Then set the channel's `Stream Selector Mode` to Custom and pick this file.
+#
+# See stream-selector-hu.yml for how item matching works. The one rule that shapes this file:
+# audio AND subtitle criteria must BOTH match within a single item, and a matching audio in
+# one item will not borrow the subtitle rule from the next. So each audio tier needs its own
+# full ladder of subtitle attempts ending in a no-subtitle twin, otherwise content with the
+# right audio but no usable subtitle falls through to the catch-all and loses its audio
+# preference too. That is why this file has nine items rather than three.
+#
+# ─── SUBTITLES ARE BURNED IN, NEVER OFFERED ───────────────────────────────────
+# ErsatzTV burns whatever subtitle it selects into the picture; it does not deliver subtitles
+# as a separate track. With MPEG-TS to Plex there will NEVER be a subtitle menu on the client.
+# So the thing to look for is burned-in text on screen, not an option in Plex's audio and
+# subtitle picker. "No subtitle track offered" is expected behaviour and not the bug.
+#
+# ─── WHY `und` IS HANDLED EXPLICITLY ──────────────────────────────────────────
+# ErsatzTV tags a sidecar subtitle file `und` when the FILENAME carries no language code. Plex
+# does the same thing and shows it as "unknown". So a folder containing `Film.srt` produces an
+# untagged subtitle that `subtitle_language: ["en*"]` can never match — the item fails, the
+# ladder falls through to `disable_subtitles`, and nothing appears on screen even though the
+# subtitle plainly exists. That is the single most likely reason this file looks broken.
+#
+# The `external and lang = 'und'` items below are a HEURISTIC, and it has a real failure mode:
+# it assumes an untagged sidecar is the English one. That holds when a file has a tagged
+# Hungarian subtitle plus one unknown, which is the common shape in this library. It is wrong
+# for a file whose only sidecar is an untagged Hungarian subtitle — that will burn Hungarian
+# text onto an English channel.
+#
+# THE REAL FIX IS TO RENAME THE FILES. ErsatzTV parses the language from the filename and
+# accepts the code before or after a forced/sdh marker:
+#
+#     Film.srt        ->  Film.en.srt          und becomes en
+#     Film.forced.srt ->  Film.forced.en.srt   also valid as Film.en.forced.srt
+#
+# Rename, rescan the Plex library, then run a Deep Scan on the library in ErsatzTV so it picks
+# up the changed subtitle metadata. Once the files are tagged, delete items 2, 5 and 8 below
+# and the guesswork goes away.
+#
+# ─── ALSO CHECK TWO GLOBAL SETTINGS ───────────────────────────────────────────
+# ErsatzTV Settings has `Use embedded subtitles` (default on) and `Extract and use embedded
+# (text) subtitles` (default OFF, because extraction is slow). Sidecar `.srt` files do not need
+# extraction, but embedded text subtitles are ignored entirely until that second setting is
+# enabled — and custom stream selectors specifically skip embedded text subtitles that have
+# not been extracted yet.
+#
+# ─── HOW TO SEE WHAT IT ACTUALLY PICKED ───────────────────────────────────────
+# Support -> Troubleshooting -> Playback, choose a title, and set the Stream Selector option to
+# this file. That reports the streams ErsatzTV can see and which one the selector chose,
+# including the real `lang` value — which is how to confirm whether an untagged sidecar arrives
+# as `und` or as something else entirely.
+
+items:
+  # ── English audio ───────────────────────────────────────────────────────────
+  # 1. English audio with a properly tagged English subtitle. The goal state.
+  - audio_language: ["en*"]
+    subtitle_language: ["en*"]
+
+  # 2. English audio with an untagged sidecar. Assumed English — see the heuristic note above.
+  - audio_language: ["en*"]
+    subtitle_condition: "external and lang = 'und'"
+
+  # 3. English audio, no usable subtitle at all.
+  - audio_language: ["en*"]
+    disable_subtitles: true
+
+  # ── Untagged tracks that NAME their language in the stream title ────────────
+  # This is how 7th Heaven ended up playing in Hungarian on an English channel. Its files
+  # carry no audio language tags at all — the tracks are merely *titled*, in Hungarian:
+  # `magyar`, `angol`, `francia`. With nothing to match, items 1 to 3 failed, the Hungarian
+  # items failed too, and the wildcard at the bottom took the first track, which is the dub.
+  #
+  # `audio_title_allowlist` discards audio streams whose title contains none of these strings,
+  # so on those files it isolates the English track by name. 19 episodes are in this state,
+  # all of them 7th Heaven. Small, but it is the difference between a channel that honours its
+  # language and one that does not.
+  - audio_language: ["*"]
+    audio_title_allowlist: ["angol", "english", "eng"]
+    subtitle_language: ["en*"]
+
+  - audio_language: ["*"]
+    audio_title_allowlist: ["angol", "english", "eng"]
+    disable_subtitles: true
+
+  # ── Hungarian audio ─────────────────────────────────────────────────────────
+  # 4. Hungarian dub only — 33 films in this library have Hungarian audio and no English
+  #    track. Pair with English subtitles if the file has them.
+  - audio_language: ["hu*"]
+    subtitle_language: ["en*"]
+
+  # 5. Hungarian audio with an untagged sidecar.
+  - audio_language: ["hu*"]
+    subtitle_condition: "external and lang = 'und'"
+
+  # 6. Hungarian audio, no usable subtitle.
+  - audio_language: ["hu*"]
+    disable_subtitles: true
+
+  # ── Anything else, including untagged audio ─────────────────────────────────
+  # 7. Any other language with English subtitles. 482 films carry an English subtitle track.
+  - audio_language: ["*"]
+    subtitle_language: ["en*"]
+
+  # 8. Any other language with an untagged sidecar.
+  - audio_language: ["*"]
+    subtitle_condition: "external and lang = 'und'"
+
+  # 9. Catch-all. Required — see the note in the Hungarian selector.
+  - audio_language: ["*"]
+    disable_subtitles: true

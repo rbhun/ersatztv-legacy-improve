@@ -1,0 +1,189 @@
+# ErsatzTV Sequential Schedule — "Movies HU" (Hungarian dub only)
+#
+# Identical dayparting and identical rating tiers to movies.yml. The only difference is
+# `AND language_tag:hu*` on every content source, which restricts this channel to films that
+# carry a Hungarian audio track. See movies.yml for the full reasoning behind the library
+# scoping, the four-step age ladder, the runtime floor and the count-versus-pad_until choice;
+# none of that is repeated here.
+#
+# ─── WHY FILTER THE QUERIES AND NOT JUST SET THE STREAM SELECTOR ──────────────
+# A stream selector chooses a track inside a file it has already been handed. It has no
+# influence over which files get scheduled. So stream-selector-hu.yml alone cannot stop an
+# English-only film airing on a Hungarian channel — it just falls down its fallback chain and
+# plays English. Restricting the catalogue is the only way to guarantee Hungarian audio.
+#
+# ─── WHY `language_tag` AND WHY THE WILDCARD ──────────────────────────────────
+# `language_tag` holds the raw stream tag. This library mixes `hu` and `hun`, so the `hu*`
+# wildcard is required — `language_tag:hu` alone would silently miss every `hun` file.
+#
+# ─── EXPECTED SIZE ────────────────────────────────────────────────────────────
+# 375 of 786 films carry Hungarian audio, roughly 48%, so each block below holds about half
+# what its movies.yml counterpart does.
+#
+# The 09:00-14:00 block is the weak one. Under-12 and dubbed matched FOUR films when it ran
+# 09:00-18:00, and shortening it to five hours does not change that count — it only halves the
+# time those four have to fill, from nine hours to five. Still thin. The 14:00 step is what
+# relieves it: the under-16 pool is 299 films before the language filter, so the afternoon
+# carries the channel. Verify both daytime counts in ErsatzTV's own search box before
+# deploying; the audit CSV has no language column, so the repo checker cannot measure them.
+#
+# If four films is too few to watch, the escape is to drop `AND language_tag:hu*` from
+# FAMILY_FILMS alone and let the stream selector pick a Hungarian track where one exists —
+# the same trade already accepted for family shows in kids-hu.yml.
+#
+# Untagged is not the same as not-Hungarian: 207 films carry no audio language tag at all and
+# are excluded from this channel even though some are certainly dubbed. Tagging those files
+# is what would grow this channel; no query change can reach them.
+
+content:
+  - search:
+    key: "FAMILY_FILMS"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 400] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6)) AND language_tag:hu*"
+    order: shuffle
+
+  # FAMILY_FILMS at 60-100 minutes. Only the overrun at the next boundary draws from it.
+  - search:
+    key: "FAMILY_SHORT"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 100] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6)) AND language_tag:hu*"
+    order: shuffle
+
+  - search:
+    key: "DAYTIME_FILMS"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 400] NOT genre:horror AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\") AND language_tag:hu*"
+    order: shuffle
+
+  # DAYTIME_FILMS at 60-100 minutes. Only the overrun at the next boundary draws from it.
+  - search:
+    key: "DAYTIME_SHORT"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 100] NOT genre:horror AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\") AND language_tag:hu*"
+    order: shuffle
+
+  - search:
+    key: "COMEDY"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND genre:comedy AND minutes:[60 TO 400] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\" OR content_rating:(hu AND 16)) AND language_tag:hu*"
+    order: shuffle
+
+  - search:
+    key: "SHORT_FILMS"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 100] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\" OR content_rating:(hu AND 16)) AND language_tag:hu*"
+    order: shuffle
+
+  # 22:00 onward is unrestricted. Do not add a ceiling to the three sources below — they are
+  # the only home the hu/18 films have on this channel.
+  - search:
+    key: "PRIME_DRAMA"
+    query: "type:movie AND library_name:\"Movies\" AND (genre:drama OR genre:thriller OR genre:crime) AND minutes:[60 TO 400] AND language_tag:hu*"
+    order: shuffle
+
+  - search:
+    key: "ACTION"
+    query: "type:movie AND library_name:\"Movies\" AND (genre:action OR genre:adventure) AND minutes:[60 TO 400] AND language_tag:hu*"
+    order: shuffle
+
+  # 242 films, unrestricted. This block exists because the 18:00 COMEDY source is capped at
+  # under-18, which on its own stranded 36 adult comedies — Blazing Saddles, Tootsie, Poor
+  # Things, Me Myself & Irene, the stand-up specials. Every genre-scoped source at 22:00 is
+  # drama, action, horror or mystery, so comedy had no unrestricted home at all.
+  - search:
+    key: "LATE_COMEDY"
+    query: "type:movie AND library_name:\"Movies\" AND genre:comedy AND minutes:[60 TO 400] AND language_tag:hu*"
+    order: shuffle
+
+  # 779 films — deliberately a catch-all: both film libraries, no genre requirement, no
+  # rating ceiling.
+  # It fills the small hours and, more importantly, it is the backstop that guarantees no
+  # film in the library is unschedulable. Anything with a missing or odd genre, or a rating
+  # this repo does not recognise, reaches the channel here and nowhere else. Do not add a
+  # genre filter to it.
+  - search:
+    key: "LATE_ANY"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") AND minutes:[60 TO 400] AND language_tag:hu*"
+    order: shuffle
+
+  # The thinnest pool on this channel — 59 films before the language filter, so expect around
+  # 30. Verify this one is non-empty before deploying.
+  - search:
+    key: "LATE_GENRE"
+    query: "type:movie AND library_name:\"Movies\" AND (genre:horror OR genre:mystery) AND minutes:[60 TO 400] AND language_tag:hu*"
+    order: shuffle
+
+reset:
+  - wait_until: "09:00"
+    tomorrow: false
+    rewind_on_reset: true
+
+playout:
+  - wait_until: "09:00"
+    tomorrow: false
+
+  # ─── NO GAPS: HOW EVERY BOUNDARY IS CLOSED ───────────────────────────────────
+  # Mirrors movies.yml, where the full reasoning is. Each boundary T is a `pad_until` T that fits
+  # whole items, then a `pad_until` T minus 15 from the same block with
+  # `stop_before_end: false`: a remainder of 15 minutes or less lets the next block start that
+  # much early, a longer one gets one more item from the ending block, which runs over T.
+  # The last instruction of the day starts the FAMILY_FILMS block early and pads to 09:00
+  # exactly, because `wait_until: "09:00"` would leave any shortfall off air.
+  # The film blocks overrun from FAMILY_SHORT and DAYTIME_SHORT, 60-100 minutes.
+  - pad_until: "14:00"
+    tomorrow: false
+    content: "FAMILY_FILMS"
+    trim: false
+    discard_attempts: 5
+
+  - pad_until: "13:45"
+    tomorrow: false
+    content: "FAMILY_SHORT"
+    stop_before_end: false
+
+  - pad_until: "18:00"
+    tomorrow: false
+    content: "DAYTIME_FILMS"
+    trim: false
+    discard_attempts: 5
+
+  - pad_until: "17:45"
+    tomorrow: false
+    content: "DAYTIME_SHORT"
+    stop_before_end: false
+
+  # 18:00 — the ceiling rises from 14 to 16.
+  - count: 1
+    content: "COMEDY"
+
+  - pad_until: "22:00"
+    tomorrow: false
+    content: "SHORT_FILMS"
+    trim: false
+    discard_attempts: 5
+
+  - pad_until: "21:45"
+    tomorrow: false
+    content: "SHORT_FILMS"
+    stop_before_end: false
+
+  # 22:00 — unrestricted from here. Five films carry the night.
+  - count: 1
+    content: "PRIME_DRAMA"
+
+  - count: 1
+    content: "ACTION"
+
+  - count: 1
+    content: "LATE_COMEDY"
+
+  - count: 1
+    content: "LATE_GENRE"
+
+  # Crosses midnight, so `tomorrow: true` is required. The catch-all backstop.
+  - pad_until: "09:00"
+    tomorrow: true
+    content: "LATE_ANY"
+    discard_attempts: 3
+    trim: false
+
+  - pad_until: "09:00"
+    tomorrow: false
+    content: "FAMILY_FILMS"
+    stop_before_end: false
+
+  - repeat: true

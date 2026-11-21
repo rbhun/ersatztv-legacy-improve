@@ -1,0 +1,586 @@
+# ErsatzTV Sequential Schedule — "Main" (general entertainment)
+#
+#   06:00  cartoons
+#   10:00  mix — family, documentaries, comedy, Top Gear
+#   14:00  mix — the same, one rating notch looser
+#   18:00  mix — comedy and broad genres
+#   20:00  feature film (under-18), then a mixed evening
+#   22:00  evening TV and adult animation, unrestricted
+#   00:00  late films, through to 06:00
+#
+# Block boundaries sit on the rating-ladder steps below, which is why the afternoon starts at
+# 14:00 and not 15:00. A single `pad_until` draws from one content source with one rating
+# ceiling, so a block straddling a step would have to be filtered to the stricter of the two
+# and the looser half of the window would be wasted.
+#
+# ─── HOW A "MIX" IS BUILT ─────────────────────────────────────────────────────
+# A sequential schedule draws each instruction from exactly ONE content source, so a block
+# that mixes genres is built by OR-ing the genres inside a single query and shuffling the
+# result. That interleaves them properly — a documentary, then a sitcom, then a family show —
+# rather than airing each genre in its own predictable run. The cost is that the proportions
+# follow pool size: the 10:00 block is about two thirds comedy simply because there is more of
+# it. Separate blocks are the only way to control the ratio, which is what the previous,
+# tighter version of this schedule did.
+#
+# ─── NOTE ON THE YAML SHAPE ───────────────────────────────────────────────────
+# `key`, `query` and `order` are SIBLINGS of `search:`, not nested under it.
+# `search:` is a valueless type discriminator. If the file fails to load, check that.
+#
+# ─── EVERY QUERY IS SCOPED BY library_name. THIS IS NOT OPTIONAL ──────────────
+# The audit (ersatztv/audit/library-audit.txt) found that `type:movie` alone is unsafe
+# here, because Plex types two junk libraries as movies:
+#   Demos         2 items — LG 4K demo loops
+#   Other videos  42 items — drone clips, GoPro footage, Zoom recordings, home video
+# 40 of those 42 carry no genre, and a query like `NOT genre:animation` is TRUE for an
+# item with no genre at all. So an unscoped movie query puts holiday drone footage in
+# prime time. Scoping to library_name:"Movies" is what prevents that.
+#
+# ─── WHY THE MORNING BLOCK USES THE CARTOONS LIBRARY, NOT genre:animation ─────
+# `genre:animation` on episodes matches **Archer** (animation|comedy, TV-MA, 75 episodes) in
+# the TV Series library — adult animation in the 06:00 children's block. Archer is the only
+# animation-tagged show in TV Series, and the sole reason that genre cannot be trusted here.
+# Selecting by library instead uses the separation already curated in Plex, and as a bonus
+# picks up the 25 episodes of "Me and Winnie the Pooh" that carry no genre at all.
+#
+# `genre:family` on TV Series IS trusted. Verified: every family-tagged show in the library is
+# genuinely family-appropriate — 7th Heaven (TV-G), Georgie & Mandy's First Marriage (TV-PG),
+# Planet Earth I/II/III (TV-G, TV-PG), The Smurfs, TaleSpin. Archer is excluded automatically,
+# carrying no `family` genre.
+#
+# ─── CONTENT RATINGS ARE HUNGARIAN ON FILMS, US-STYLE ON TV ───────────────────
+# Films, measured: hu/16 (257), hu/12 (210), hu/18 (136), hu/KN (17), hu/6 (8), hu/14 (6),
+# with a US-style minority (R 37, PG-13 30, PG 15, G 12). So `content_rating:"PG"` would match
+# 15 of 786 films — nearly useless. `hu/KN` and `hu/6` are the child-safe values, and
+# `NOT content_rating:"hu/18"` is the lever for keeping the strongest material out of a daypart.
+# TV uses TV-G / TV-Y / TV-Y7 / TV-PG / TV-14 / TV-MA, which is what the blocks below filter on.
+
+# ─── THE AGE LADDER ──────────────────────────────────────────────────────────
+# Four steps, enforced across every channel and machine-checked by scripts/check_watershed.py:
+#
+#   06:00-14:00   nothing 12+        TV-G, TV-Y, TV-Y7, TV-PG
+#   14:00-18:00   nothing 16+        the above plus TV-14
+#   18:00-22:00   nothing 18+        the above; TV has no 16 level, so this equals TV-14
+#   22:00-06:00   anything           TV-MA and unrated
+#
+# EVERY STEP IS AN ALLOW-LIST, NEVER AN EXCLUSION. This distinction is the whole safety
+# mechanism. `NOT show_content_rating:"TV-MA"` is TRUE for an item with no rating at all, and
+# this library has unrated adult drama in it — Terapia (40 episodes) and The Fear Index (4)
+# both carry no content rating and would sail through any exclusion-based filter. An
+# allow-list fails closed: unknown means excluded, and unknown therefore airs after 22:00
+# only.
+#
+# The 06:00 step admits The Big Bang Theory, Friends, Northern Exposure, Georgie & Mandy,
+# Showder Klub, How It's Made, Planet Earth and Top Gear. TV-G and TV-Y7 alone would leave
+# zero comedy episodes, so TV-PG is load bearing, not a concession.
+#
+# The 14:00 step is where Gilmore Girls, HIMYM, Two and a Half Men, Miami Vice and The Grand
+# Tour arrive. Because US TV ratings jump straight from TV-14 to TV-MA, the 18:00 step changes
+# nothing for episodes — it only matters to films, where hu/16 becomes available.
+#
+# The 395 episodes above TV-14 reach only the 22:00 step, via NIGHT_MIX. Without that block
+# they would be unschedulable anywhere, which is exactly the trap an earlier version of this
+# file fell into.
+#
+# The Cartoons library is the one source left on library curation rather than a rating
+# allow-list, because "Me and Winnie the Pooh" carries no rating and an allow-list would drop
+# its 25 episodes. All six shows in that library are verified TV-G or TV-Y7 bar that one.
+
+content:
+  # 422 episodes across 6 shows. Four hours a day will cycle this pool roughly weekly — that
+  # is a library-size fact, not a scheduling bug.
+  # ─── MARATHON, NOT SHUFFLE — TWO PROBLEMS, ONE FIX ───────────────────────────
+  # A `search` source with `order: shuffle` picks items at random from a flat pool, which
+  # caused both of the complaints about this channel at once.
+  #
+  # Episodes came out jumbled: 7th Heaven ran S01E10, S09E11, S02E06, S04E11 in a single day.
+  # And airtime followed POOL SIZE, so Top Gear's 226 episodes bought it 30% of the pre-14:00
+  # block and 7th Heaven's 200 another 20% — four shows were three quarters of the day.
+  #
+  # A marathon grouped by show fixes both. `item_order: chronological` means each show
+  # advances S01E01, S01E02, S01E03 across days, and `play_all_items: false` means one
+  # episode is taken from a show before moving to the next, so every show gets an EQUAL share
+  # of slots no matter how many episodes it owns. Top Gear goes from 30% to 1/n.
+  # `shuffle_groups: true` randomises which show is up next, so the running order is not a
+  # fixed rotation.
+  #
+  #
+  # THE FLIP SIDE: equal shares also means a small show gets as much airtime as a big one.
+  # National Geographic Explorer has ONE episode and would have aired more often than any
+  # episode of Friends. The documentary series were moved to the DOCUMENTARY slot for exactly
+  # this reason. Three tiny groups remain because they have nowhere else to go, and repeating
+  # them is judged better than stranding them: Animaniacs (3 episodes, CARTOONS), The Jeff
+  # Dunham Show (1, afternoon and evening) and Fabulous Beasts (2, NIGHT_MIX). If any of them
+  # becomes irritating, name it out of its source — do not switch to play_all_items.
+  #
+  # Note that a playout reset restarts every show at S01E01. That is the right behaviour here,
+  # but it does mean the position is not preserved across the resets needed to deploy changes.
+  - marathon:
+    key: "CARTOONS"
+    searches:
+      - "type:episode AND library_name:\"Cartoons\" AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\" OR show_title:\"Me & Winnie the Pooh\" OR show_title:\"The New Adventures of Jonny Quest\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # ─── TWO SHOWS ARE HELD OFF THE ENGLISH CHANNEL ON LANGUAGE GROUNDS ─────────
+  # Re-measured against Plex 2026-10-09 15:10, after the duplicate English versions were
+  # deleted. The earlier note in this file described a library state that no longer exists.
+  #
+  # 7th Heaven now has 194 files, ONE version each, every one of them from the same Hungarian
+  # release pack (`/mnt/media/TV/7th Heaven/Hetedik mennyorszag S01-S11/`). Audio tracks:
+  #
+  #     174 files   one untagged, untitled mp3 stereo track   <- seasons 2-11
+  #      17 files   magyar + angol + francia                  <- season 1
+  #       2 files   magyar + english                          <- S10E14, S10E22
+  #       1 file    magyar + Commentary + francia             <- S01E15
+  #
+  # So exactly 19 episodes carry an identifiable English audio track, and stream-selector-en.yml
+  # isolates those by stream TITLE — ErsatzTV reports them as `{"Language":"und","Title":"angol"}`,
+  # confirmed from its own debug log, so `audio_title_allowlist` reaches them even though no
+  # `languageTag` exists. That selector change is in the repo but NOT yet deployed; the running
+  # selector logs `"AudioTitleAllowlist":[]`.
+  #
+  # The other 174 files have a single track, so whatever language it is, it plays — no selector
+  # can change that. Coming from a Hungarian pack whose season 1 files put `magyar` first, it is
+  # almost certainly the dub. UNVERIFIED: confirm by ear via Troubleshooting -> Playback on
+  # S02E01. If it turns out to be English, delete this exclusion entirely.
+  #
+  # ─── SO THE 19 ARE SCHEDULED, AND ONLY THE 19 ─────────────────────────────────
+  # The blanket `NOT show_title:"7th Heaven"` stays in the first search of DAYTIME_MIX and
+  # AFTERNOON_MIX, and a SECOND search adds back exactly the episodes that can air in English.
+  # A marathon is the union of its searches, and `group_by: show` keeps them as one group, so
+  # the show gets one slot per round-robin cycle rather than the nine airings in a day that
+  # started this.
+  #
+  # The scoping is by `season_number` and `episode_number`, which are real episode search
+  # fields (https://ersatztv.org/docs/search/), so no files had to be touched. S01E15 is
+  # excluded by number: its second track is titled `Commentary`, not `angol`, so the allowlist
+  # would miss it and it would fall through to item 7 and air dubbed.
+  #
+  # This is pinned to the current file inventory and will go stale. The durable fix is to tag
+  # the English track with ffmpeg — `-metadata:s:a:1 language=eng`, lossless with `-c copy` —
+  # after which `language_tag:en*` identifies these episodes directly and this hand-written
+  # episode list can be deleted.
+  #
+  # The remaining 174 episodes stay off this channel, because they would air dubbed with
+  # burned-in English subtitles — selector item 7 (`audio_language: ["*"]` plus an English
+  # sidecar) is what produced exactly that symptom.
+  #
+  # Season gaps, unrelated to language but worth knowing: 51 of 245 broadcast episodes are
+  # absent. Season 7 is missing in its entirety and season 11 has 1 of 23.
+  #
+  # Showder Klub is Hungarian stand-up. 8 of 14 sampled episodes are explicitly `hun` tagged
+  # and there is no English audio to find. It belongs on the Hungarian channels only.
+  #
+  # Both shows remain on main-hu.yml, where they are correct, and 7th Heaven is still on the
+  # Kids channels — see the note on FAMILY_SHOWS in kids.yml.
+  #
+  # ─── DAYTIME_MIX — 10:00 to 14:00, ceiling age 10 ───────────────────────────
+  # 15 shows, 1028 episodes. Five genres: family, comedy, reality, documentary and drama.
+  #
+  # `reality` is load bearing rather than stylistic — Plex tags Top Gear `reality|talk show`,
+  # NOT documentary, so dropping it would cost 226 episodes.
+  #
+  # `documentary` and `drama` were added 2026-10-09 to match AFTERNOON_MIX. Before that this
+  # block was SIX shows: Big Bang, Friends, Top Gear, Northern Exposure, How It's Made and
+  # Georgie & Mandy. The nature series — Planet Earth I/II/III, MegaStructures, Ancient
+  # Megastructures, Amazing Planet, Ultimate Factories, National Geographic Explorer — were
+  # barred from the morning by GENRE while passing the age ceiling comfortably, which is the
+  # same fault as a rating ceiling with no fallback. Pan Am arrives via `drama`.
+  # `show_title:"How It's Made"` is gone because `show_genre:documentary` now covers it.
+  #
+  # ─── THE PRICE: NINE SHOWS, FIFTY-FOUR EPISODES, SIXTY PERCENT OF SLOTS ─────
+  # `play_all_items: false` gives each GROUP one slot per cycle regardless of size, so the nine
+  # new shows carry 54 episodes between them and claim 9/15 of morning slots. Share per show
+  # falls from 16.7% to 6.7%. National Geographic Explorer has ONE episode; it now airs roughly
+  # as often as any single episode of The Big Bang Theory, in the morning and again in the
+  # afternoon. This was chosen knowingly: variety across shows beats variety across episodes
+  # here, because six shows made the morning feel like a loop. If it grates, name the 1-5
+  # episode shows out of this block and leave them in AFTERNOON_MIX.
+  # ─── TERAPIA IS NAMED OUT, AND PLEX IS THE REASON ──────────────────────────
+  # Terapia is the Hungarian In Treatment — forty episodes of adult psychotherapy drama. It
+  # reached the 10:00 block on 2026-10-10 through two independent changes that were each fine
+  # alone: Plex gained a rating for it (it was unrated, it is now TV-PG) and `show_genre:drama`
+  # was added to these two blocks the day before. TV-PG scores age 10, so check_watershed.py
+  # passes it and always will. No schedule rule can catch a wrong rating — only a name can.
+  # Same class of fault as `Taken` arriving as hu/6, caught by the slot audit.
+  - marathon:
+    key: "DAYTIME_MIX"
+    searches:
+      - "type:episode AND library_name:\"TV Series\" NOT show_title:\"Terapia\" NOT show_title:\"7th Heaven\" NOT show_title:\"Showder Klub\" AND (show_genre:family OR show_genre:comedy OR show_genre:reality OR show_genre:documentary OR show_genre:drama) AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\")"
+      - "type:episode AND show_title:\"7th Heaven\" AND ((season_number:1 AND NOT episode_number:15) OR (season_number:10 AND (episode_number:14 OR episode_number:22)))"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # ─── AFTERNOON_MIX — 14:00 to 18:00, the widest TV block on the channel ─────
+  # 26 shows, 2021 episodes. Three things separate it from DAYTIME_MIX:
+  #
+  #   TV-14 is added. That is the 14:00 step, and it is what brings Gilmore Girls, HIMYM,
+  #   Two and a Half Men, Ally McBeal, Miami Vice, The Grand Tour and Grey's Anatomy in.
+  #   Top Gear is TV-PG and reaches both blocks; The Grand Tour is TV-14 and so reaches
+  #   this one and the evening, never the morning.
+  #
+  #   `drama` is in the genre list. Without it, Grey's Anatomy (250 episodes, drama|romance)
+  #   and Pan Am (14, drama|history) were unreachable on this channel at any hour before
+  #   18:00, despite sitting comfortably inside the ceiling. It also admits Miami Vice (115)
+  #   and The Pillars of the Earth (8), both TV-14 and both reasonable here.
+  #
+  #   `documentary` is in the genre list and the nature series are NOT excluded. They also
+  #   sit in the 10:00 DOCUMENTARY slot, so they air in both — an explicit choice, made
+  #   knowing the cost below.
+  #
+  # Nothing in the resulting pool exceeds age 14, so the 14:00 ceiling holds by construction
+  # rather than by exclusion. 7th Heaven and Showder Klub stay named-out.
+  #
+  # ─── THE COST OF A WIDE POOL UNDER ROUND-ROBIN ──────────────────────────────
+  # `play_all_items: false` with `group_by: show` gives every show one slot per cycle, so a
+  # show's share is 1/26 regardless of how many episodes it has. At 26 groups and roughly 8
+  # slots in the block, a full cycle takes about three days. National Geographic Explorer has
+  # ONE episode, so that episode airs every three days or so, as often as any single episode
+  # of Grey's Anatomy. Amazing Planet (3) and Ultimate Factories (2) are nearly as thin.
+  # That is the trade for variety across shows, and it was accepted deliberately. Setting
+  # `play_all_items: true` would weight by episode count instead and bury the short runs.
+  - marathon:
+    key: "AFTERNOON_MIX"
+    searches:
+      - "type:episode AND library_name:\"TV Series\" NOT show_title:\"Terapia\" NOT show_title:\"7th Heaven\" NOT show_title:\"Showder Klub\" AND (show_genre:family OR show_genre:comedy OR show_genre:reality OR show_genre:documentary OR show_genre:drama) AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\" OR show_content_rating:\"TV-14\")"
+      - "type:episode AND show_title:\"7th Heaven\" AND ((season_number:1 AND NOT episode_number:15) OR (season_number:10 AND (episode_number:14 OR episode_number:22)))"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # 2060 episodes. Everything up to and including TV-14, across comedy and a deliberately
+  # broad genre list. The breadth is what keeps action, war and adventure series on the air at
+  # all: The Grand Tour, The Mandalorian, Halo, Moon Knight and Masters of the Air were every
+  # one of them unreachable by any query before these genres were added.
+  - marathon:
+    key: "EVENING_MIX"
+    searches:
+      - "type:episode AND library_name:\"TV Series\" NOT show_title:\"7th Heaven\" NOT show_title:\"Showder Klub\" AND (show_genre:comedy OR show_genre:drama OR show_genre:crime OR show_genre:action OR show_genre:adventure OR show_genre:thriller OR show_genre:war OR show_genre:history OR show_genre:\"science fiction\" OR show_genre:fantasy OR show_genre:mystery OR show_genre:reality) AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\" OR show_content_rating:\"TV-14\") NOT show_title:\"Planet Earth\" NOT show_title:\"Planet Earth II\" NOT show_title:\"Planet Earth III\" NOT show_title:\"Ancient Megastructures\" NOT show_title:\"National Geographic Explorer\""
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # ─── NIGHT_MIX IS THE COMPLEMENT, NOT THE WHOLE CATALOGUE ─────────────────
+  # This used to carry NO rating restriction at all, which did not mean "adult series" — it
+  # meant *every* series in the library. That is why Top Gear aired at 22:16 and a 12-second
+  # sliver of Friends at 23:59. An unrestricted query is a superset of the daytime query, so
+  # the daytime shows were always going to be the bulk of it: Top Gear and The Big Bang
+  # Theory alone are 300 of the 2553 episodes it matched.
+  #
+  # It is now an allow-list of the material that can air ONLY here — 404 episodes that no
+  # other block on the channel can reach:
+  #
+  #   TV-MA        358  Californication 84, Archer 75, Game of Thrones 68, Strike Back 21,
+  #                     Landman 20, House of Cards 13, The Borgias 12, Westworld 11,
+  #                     Foundation 10, Treadstone 10, Masters of the Air 9, Big Little Lies 7,
+  #                     Breaking Bad 7, Dune: Prophecy 6, Chernobyl 5
+  #   unrated        6  The Fear Index 4, Fabulous Beasts 2
+  #
+  # Terapia (40) and Breaking Bad (7) are excluded here although their ratings admit
+  # them: measured against Plex, Terapia has 24 Hungarian-tagged episodes and ZERO
+  # English, and Breaking Bad's only copies in this library are Hungarian dubs. Both
+  # air on main-hu.yml instead. Terapia is the Hungarian In Treatment, so this is
+  # where it belonged all along.
+  #
+  # The three unrated shows are named explicitly rather than swept in by `NOT`, because the
+  # unrated set ALSO contains Me & Winnie the Pooh (25) and The New Adventures of Jonny Quest
+  # (26). An exclusion-based query would have put children's cartoons in the 02:00 slot and
+  # left these three unreachable. Naming shows is safe in a way that `NOT rating` never is.
+  #
+  # Genre filtering is gone too: at this hour nothing needs holding back, so a genre list can
+  # only strand things. 404 episodes against roughly four hours a night is ~85 days of
+  # material, so nothing repeats inside three months.
+  - marathon:
+    key: "NIGHT_MIX"
+    searches:
+      - "type:episode AND (library_name:\"TV Series\" OR library_name:\"Cartoons\") NOT show_title:\"Breaking Bad\" AND (show_content_rating:\"TV-MA\" OR show_title:\"The Fear Index\" OR show_title:\"Fabulous Beasts\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # 532 films. The 20:00 feature starts inside the 18:00 step, so it carries the under-18
+  # ceiling: hu/16 is in, hu/18 and R are not. Animation and horror are held back for the Kids
+  # and late-night slots. The stronger films reach the channel through NIGHT_FILM instead.
+  - search:
+    key: "FEATURE_FILM"
+    query: "type:movie AND library_name:\"Movies\" NOT genre:animation NOT genre:horror AND minutes:[60 TO 400] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:(hu AND 12) OR content_rating:(hu AND 14) OR content_rating:\"12\" OR content_rating:\"PG\" OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\") OR content_rating:\"TV-G\" OR content_rating:(hu AND 16))"
+    order: shuffle
+
+  # ─── DOCUMENTARY — the Documentaries library only, 44 films ─────────────────
+  # Until 2026-10-09 this source also held the 40 documentary EPISODES and was their only home.
+  # Those now mix through DAYTIME_MIX and AFTERNOON_MIX, which is where they were wanted, so
+  # only the films are left here.
+  #
+  # ─── WHY THE FILMS STILL NEED A SLOT OF THEIR OWN ───────────────────────────
+  # They cannot join the marathon. `group_by` accepts only show, season, artist and album
+  # (https://ersatztv.org/docs/scheduling/sequential/content) and a movie has none of those, so
+  # the grouping of a `type:movie` search inside a marathon is undefined. If each film became
+  # its own group it would take 44 of 59 morning slots. Not worth finding out in production.
+  #
+  # They also cannot join MATINEE, which is the midday FILM. These are 23-96 minutes with a
+  # median of 52 — they are 45-minute TV documentaries misfiled as movies in a Documentaries
+  # library, not features. Folding them in would make 45% of midday "films" a 45-minute
+  # documentary, which runs directly against wanting more feature films on this channel.
+  #
+  # So: one slot, straight after the cartoons, which is a natural transition anyway.
+  #
+  # This branch trusts LIBRARY CURATION rather than ratings, and so uses exclusions where the
+  # rest of this file insists on allow-lists. Deliberate: 32 of the 44 titles carry no content
+  # rating and 6 more say "Not Rated", so an allow-list would reduce the library to five
+  # titles. Excluded are the two with an adult rating, both Plex mismatches rather than real
+  # documentaries — "Grand Canyon" (R, tagged crime|drama) and "Jerusalem" (PG-13, drama).
+  # The same argument already applies to the Cartoons library.
+  - search:
+    key: "DOCUMENTARY"
+    query: "type:movie AND library_name:\"Documentaries\" AND minutes:[20 TO 400] NOT content_rating:\"R\" NOT content_rating:\"PG-13\""
+    order: shuffle
+
+  # ─── MATINEE — the 12:00 film ────────────────────────────────────────────────
+  # Films at the under-12 ceiling: hu/KN, PG, G, hu/6 and the one `Passed`. Horror dropped.
+  # City Lights, 12 Angry Men, Dial M for Murder, American Graffiti, An American in Paris,
+  # Buena Vista Social Club. Animation stays in, 13 of them, because midday is the right place
+  # for it on this channel.
+  #
+  # `Animated` must be named alongside `Movies`, here and in AFTERNOON_FILM. 32 files sit in
+  # both Plex libraries; ErsatzTV imports a file once and filed them under Animated, so
+  # `library_name:"Movies"` alone silently loses Toy Story, Shrek, The Lion King and the rest.
+  #
+  # ─── THE 185-MINUTE CEILING IS STRUCTURAL ───────────────────────────────────
+  # A `count` ends when its film ends, so an over-long matinee eats the instructions after it.
+  # Unbounded, this source held `Cleopatra` (251 min) and `Lawrence of Arabia` (227) — starting
+  # at 12:00 those run to 16:11 and 15:47, and the 16:00 afternoon film simply never airs.
+  # 185 is chosen rather than 150 to keep the long musicals, which are the point of a matinee:
+  # `Fiddler on the Roof` (181) and `My Fair Lady` (173) stay, and the worst case ends at 15:05
+  # with the 16:00 film still intact. Two films are excluded.
+  - search:
+    key: "MATINEE"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") NOT genre:horror AND minutes:[60 TO 185] AND (content_rating:\"G\" OR content_rating:\"TV-G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:\"PG\" OR content_rating:\"Passed\")"
+    order: shuffle
+
+  # ─── AFTERNOON_FILM — the 16:00 film ─────────────────────────────────────────
+  # 321 films at the under-16 ceiling, which is where this library actually lives: hu/12 alone
+  # is 222 of them. Median 110 minutes. Horror held back, animation kept.
+  - search:
+    key: "AFTERNOON_FILM"
+    query: "type:movie AND (library_name:\"Movies\" OR library_name:\"Animated\") NOT genre:horror AND minutes:[60 TO 400] AND (content_rating:\"G\" OR content_rating:\"TV-G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6) OR content_rating:\"PG\" OR content_rating:\"Passed\" OR content_rating:(hu AND 12) OR content_rating:\"12\" OR content_rating:(hu AND 14) OR content_rating:\"PG-13\" OR content_rating:(hu AND \"PG-13\"))"
+    order: shuffle
+
+  # ─── NIGHT_FILM — the two films from 22:00 ───────────────────────────────────
+  # 828 films: the whole feature-length Movies library, filtered on nothing but runtime and
+  # the library scope. No rating cap, because 22:00 is where the ladder opens, and no genre
+  # filter either.
+  #
+  # This replaced a horror/thriller/mystery-scoped source of 143 films. That scoping was doing
+  # damage in two directions at once: it made the late slot monotonous, and because
+  # FEATURE_FILM is capped at under-18, an adult film outside those three genres had no block
+  # on the channel it could reach at all. 228 films were in that position. Widening to
+  # age-only fixes both, and is why both night slots now draw from one source instead of two.
+  - search:
+    key: "NIGHT_FILM"
+    query: "type:movie AND library_name:\"Movies\" AND minutes:[60 TO 400]"
+    order: shuffle
+
+reset:
+  - wait_until: "06:00"
+    tomorrow: false
+    rewind_on_reset: true
+
+playout:
+  - wait_until: "06:00"
+    tomorrow: false
+
+  # ─── NO GAPS: HOW EVERY BOUNDARY IS CLOSED ───────────────────────────────────
+  # User rule, 2026-11-19: no gaps and no cartoon filler. Each daypart boundary T is two
+  # instructions:
+  #
+  #   1. `pad_until` T, `trim: false`: whole items from the ending block, as many as fit.
+  #   2. `pad_until` T minus 15 minutes from the same block, `stop_before_end: false`.
+  #
+  # If step 1 leaves 15 minutes or less, step 2 is a no-op (`tomorrow: false` and its time
+  # has passed) and the next block starts up to 15 minutes early. If more is left, step 2 adds
+  # whole items until the clock passes T minus 15, so its last item runs over T and the next
+  # block starts late. The overrun always comes from the earlier, stricter block, so the only
+  # ladder exposure is the early start, bounded at 15 minutes; scripts/check_watershed.py
+  # allows exactly that.
+  #
+  # `stop_before_end` is missing from the ErsatzTV docs but is a field of every `pad_until`
+  # (default true). When false, items are added until the target is reached or passed instead
+  # of only while they fit.
+  #
+  # The day-start boundary is the exception. The CARTOONS block is the stricter one, so rather
+  # than another late-night title, the last instruction of the day starts the CARTOONS block
+  # early and pads to 06:00 exactly. It must reach 06:00: `repeat` leads to
+  # `wait_until: "06:00"`, which would leave any shortfall off air.
+  #
+  # No `fallback` anywhere. It loops ONE item over the gap, and the next engine failed when a
+  # viewer joined deep into the loop (2026-11-18).
+  - pad_until: "10:00"
+    tomorrow: false
+    content: "CARTOONS"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "09:45"
+    tomorrow: false
+    content: "CARTOONS"
+    stop_before_end: false
+
+  # ─── WHY THERE IS NOW A FILM IN THE MIDDLE OF THE DAY ────────────────────────
+  # 10:00-20:00 used to be ten unbroken hours of series, and the result was a channel that
+  # looked like four shows on a loop. Measured on the 9 Oct guide: Top Gear 251 minutes,
+  # 7th Heaven 134, The Big Bang Theory 80, Friends 64 — and exactly one film all day.
+  #
+  # That is pool arithmetic, not bad luck. Weighted by runtime, Top Gear is 30% of the
+  # pre-14:00 pool and 7th Heaven another 20%; four shows are three quarters of it. Shuffling
+  # a pool cannot make it more varied than the pool is. The library has 828 feature films
+  # against 16 daytime-rated shows, so the only real source of variety here is films.
+  #
+  # Two go in: a matinee at 12:00 and a second at 16:00. That is roughly 3.5 hours a day moved
+  # from series to film, and it halves each show's daily airtime.
+  # 10:00 — one documentary a day, in its own slot rather than diluted into the mix.
+  - count: 1
+    content: "DOCUMENTARY"
+
+  - pad_until: "12:00"
+    tomorrow: false
+    content: "DAYTIME_MIX"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "11:45"
+    tomorrow: false
+    content: "DAYTIME_MIX"
+    stop_before_end: false
+
+  - count: 1
+    content: "MATINEE"
+
+  # ─── THE MOP-UP PADS ARE LOAD BEARING, NOT TIDINESS ──────────────────────────
+  # A `count` ends whenever its film ends, so the instruction after it inherits a clock that
+  # could be anywhere. The matinee is 60 to 251 minutes, so it can finish as early as 13:00 —
+  # before the 14:00 step. Letting AFTERNOON_MIX follow it directly would put TV-14 on screen
+  # at 13:00, an hour inside the under-12 ceiling.
+  #
+  # So each film is followed by a pad drawing from the SAME source as the block before it,
+  # holding the stricter ceiling right up to the step. If the film instead overruns the step,
+  # the pad simply schedules nothing — `tomorrow: false` with a time already past is a no-op,
+  # which is exactly the behaviour wanted here.
+  - pad_until: "14:00"
+    tomorrow: false
+    content: "DAYTIME_MIX"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "13:45"
+    tomorrow: false
+    content: "DAYTIME_MIX"
+    stop_before_end: false
+
+  # 14:00 — the ceiling rises from 12 to 16, which for episodes means TV-14 arrives.
+  - pad_until: "16:00"
+    tomorrow: false
+    content: "AFTERNOON_MIX"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "15:45"
+    tomorrow: false
+    content: "AFTERNOON_MIX"
+    stop_before_end: false
+
+  - count: 1
+    content: "AFTERNOON_FILM"
+
+  - pad_until: "18:00"
+    tomorrow: false
+    content: "AFTERNOON_MIX"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "17:45"
+    tomorrow: false
+    content: "AFTERNOON_MIX"
+    stop_before_end: false
+
+  # 18:00 — genres open up. 7th Heaven is excluded from this source: it aired at 19:44 on
+  # 9 Oct, and a daytime family drama in the pre-prime hour was the specific thing that
+  # prompted this rewrite.
+  - pad_until: "20:00"
+    tomorrow: false
+    content: "EVENING_MIX"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "19:45"
+    tomorrow: false
+    content: "EVENING_MIX"
+    stop_before_end: false
+
+  # One film, whole, at 20:00 — the anchor of the evening. Capped at under-18 because it
+  # begins before 22:00.
+  - count: 1
+    content: "FEATURE_FILM"
+
+  # Mops up between the film ending and 22:00, still at the under-18 ceiling, so it draws from
+  # EVENING_MIX rather than the unrestricted pool. On a median night this is a few minutes.
+  - pad_until: "22:00"
+    tomorrow: false
+    content: "EVENING_MIX"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "21:45"
+    tomorrow: false
+    content: "EVENING_MIX"
+    stop_before_end: false
+
+  # ─── 22:00 ONWARD IS FILMS ───────────────────────────────────────────────────
+  # Two more films, both from the unrestricted 828-film pool, which together carry the channel
+  # to roughly 02:00. `count: 1` and not `pad_until`, deliberately: the gap left after a film
+  # is routinely under an hour and nothing in a 60-to-263 minute pool fits it. With `count`
+  # each film plays whole and the next starts when it ends, so the evening drifts rather than
+  # fragmenting. Only the 22:00 anchor is fixed, held by the pads above.
+  - count: 1
+    content: "NIGHT_FILM"
+
+  - count: 1
+    content: "NIGHT_FILM"
+
+  # ─── THE ADULT SERIES STILL NEED A HOME ──────────────────────────────────────
+  # 404 episodes are rated TV-MA or unrated-adult and the ladder allows them only after 22:00.
+  # Deleting this block rather than moving it would have stranded every one of them, which is
+  # the mistake this project has now made three times. NIGHT_MIX is no longer the whole
+  # catalogue, so Top Gear and Friends can no longer appear here.
+  #
+  # The honest cost: on a median night the two films above end around 02:00, so these episodes
+  # air 02:00-06:00 and will rarely be watched live. Reversible by swapping this block with
+  # the two `count` instructions above.
+  - pad_until: "06:00"
+    tomorrow: true
+    content: "NIGHT_MIX"
+    discard_attempts: 12
+    trim: false
+
+  - pad_until: "06:00"
+    tomorrow: false
+    content: "CARTOONS"
+    stop_before_end: false
+
+  - repeat: true
+
+# ─── OPTIONAL REFINEMENTS ─────────────────────────────────────────────────────
+# Stop programmes being clipped at daypart boundaries: sequential schedules only support
+# `chronological` and `shuffle` ordering, so there is no episode-order mode here. If you
+# want serialised dramas in sequence, either switch `order: chronological` (it will start
+# from episode 1 every rebuild) or move that channel to a Classic Schedule, which offers
+# "Shuffle in Order".
+#
+# Gaps are closed by an overrun pad at every boundary -- see the note on the 10:00 block. Do
+# not reintroduce `fallback` or cartoon filler: the user ruled both out on 2026-11-19.

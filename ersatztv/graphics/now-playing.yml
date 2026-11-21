@@ -1,0 +1,73 @@
+# A lower-third title card that fades in at the start of every programme and fades out again,
+# so it is possible to tell where one show ends and the next begins.
+#
+# ─── DEPLOY TO A THIRD LOCATION ───────────────────────────────────────────────
+# Graphics elements do NOT live with the schedules. Text elements go in:
+#
+#     /opt/ersatztv/config/templates/graphics-elements/text/now-playing.yml
+#
+# (container path `/config/templates/graphics-elements/text/now-playing.yml`). ErsatzTV
+# creates the `image`, `text`, `subtitle` and `motion` subfolders itself on startup.
+#
+# ─── TEST THIS BEFORE WIRING IT INTO A SCHEDULE ───────────────────────────────
+# It is deliberately NOT referenced by any schedule yet. Two fields below are written from the
+# changelog rather than from the documented example — `opacity_expression` and the
+# `MediaItem_*` template variables — so confirm it renders before putting it on a live
+# channel. Support -> Troubleshooting -> Playback lets you select graphics elements and see
+# the result immediately, which is the safe way to find out.
+#
+# Once it renders, add one line to the top of a channel's playout, just after `wait_until`:
+#
+#     - graphics_on: "text/now-playing.yml"
+#
+# It stays on until turned off, and that is what we want: the opacity expression below is
+# evaluated per media item, so leaving it on produces a card at the start of every programme
+# rather than one card at the start of the day.
+#
+# ─── HOW THE TIMING WORKS ─────────────────────────────────────────────────────
+# `opacity_expression` returns an opacity from 0.0 to 1.0 and can use `content_seconds` (how
+# far the frame is into the current item), `content_total_seconds`, `channel_seconds` and
+# `time_of_day_seconds`. `LinearFadeDuration(time, start, fadeSeconds, peakSeconds)` gives a
+# fade up, a hold, and a fade down.
+#
+# Below: nothing for the first second, one second fading in, twelve seconds held, one second
+# fading out — so the card is visible for roughly the first fifteen seconds of each programme
+# and never covers anything after that.
+#
+# Note that `content_seconds` counts from the start of the ITEM, not from when the viewer
+# tuned in. Joining a channel mid-programme shows no card, which is correct — the card marks a
+# transition, and there was none.
+
+opacity_expression: "LinearFadeDuration(content_seconds, 1, 1, 12)"
+
+location: "BottomLeft"
+horizontal_margin_percent: 5
+vertical_margin_percent: 8
+z_index: 2
+
+# Keep the card clear of the burned-in subtitles, which sit bottom-centre. Scaling the text to
+# a fixed share of the frame keeps long episode titles from running off the side.
+width_percent: 55
+text_fit: scale
+text_align: left
+
+styles:
+  - name: "title"
+    font_family: "Roboto"
+    font_size: 44
+    text_color: "#FFFFFF"
+    halo_color: "#000000"
+    halo_width: 3
+    halo_blur: 4
+    line_height: 1.2
+
+base_style: "title"
+
+# 0 = only the currently airing entry. Raise it if you later want an "up next" line, which
+# would need the EPG variables rather than the MediaItem ones.
+epg_entries: 0
+
+# Episodes render as two lines, films as one, because the show title is empty for a film.
+text: |
+  {{ MediaItem_ShowTitle }}
+  {{ MediaItem_Title }}

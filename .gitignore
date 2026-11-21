@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Library inventory with real file names; regenerate with scripts/plex_library_audit.py
+ersatztv/audit/

@@ -1,0 +1,176 @@
+# ErsatzTV Sequential Schedule — "Kids & Family"
+#
+#   07:00  cartoons
+#   15:00  family shows
+#   18:00  family feature
+#   20:30  nature, to wind down
+#   21:00  off air until 07:00
+#
+# ─── SAFETY: WHY THE SCOPES LOOK LIKE THIS ────────────────────────────────────
+# Cartoons come from `library_name:"Cartoons"` rather than `genre:animation`, because the
+# audit showed `genre:animation` matches **Archer** (animation|comedy, TV-MA, 75 episodes)
+# in the TV Series library. Archer is the ONLY animation-tagged show in TV Series, and it is
+# the single reason that genre cannot be trusted for a children's channel.
+#
+# Family shows are pulled from TV Series by `genre:family`, which is safe here and verified:
+# every family-tagged show in the library is genuinely family-appropriate —
+#   The Smurfs (TV-G) · TaleSpin (TV-Y7) · 7th Heaven (TV-G)
+#   Georgie & Mandy's First Marriage (TV-PG) · Planet Earth I/II/III (TV-G, TV-PG)
+# Archer is excluded automatically, because it carries no `family` genre. No negation needed.
+#
+# Residual risk, stated plainly: tag an adult show `family` in Plex, or drop an adult
+# cartoon into the Cartoons library, and it will appear here. The guard is library hygiene.
+#
+# Selecting Cartoons by library also reaches the 25 episodes of "Me and Winnie the Pooh",
+# whose show carries no genre and which no genre query can ever see.
+#
+# ─── LIBRARY SIZE, HONESTLY ───────────────────────────────────────────────────
+# Cartoons: 422 episodes over 6 shows — Tom and Jerry (159), Dexter's Laboratory (127),
+# The Smurfs (52), TaleSpin (33), Jonny Quest (26), Me and Winnie the Pooh (25). Roughly
+# 100 hours. Family shows add 246 episodes, most of it 7th Heaven (199). Even so, a 14-hour
+# day cycles this in about a week. The only real fix is more content, so the hours stay
+# shorter than main.yml rather than pretending otherwise.
+
+content:
+  # ─── MARATHON, NOT SHUFFLE — TWO PROBLEMS, ONE FIX ───────────────────────────
+  # A `search` source with `order: shuffle` picks items at random from a flat pool, which
+  # caused both of the complaints about this channel at once.
+  #
+  # Episodes came out jumbled: 7th Heaven ran S01E10, S09E11, S02E06, S04E11 in a single day.
+  # And airtime followed POOL SIZE, so Top Gear's 226 episodes bought it 30% of the pre-14:00
+  # block and 7th Heaven's 200 another 20% — four shows were three quarters of the day.
+  #
+  # A marathon grouped by show fixes both. `item_order: chronological` means each show
+  # advances S01E01, S01E02, S01E03 across days, and `play_all_items: false` means one
+  # episode is taken from a show before moving to the next, so every show gets an EQUAL share
+  # of slots no matter how many episodes it owns. Top Gear goes from 30% to 1/n.
+  # `shuffle_groups: true` randomises which show is up next, so the running order is not a
+  # fixed rotation.
+  #
+  #
+  # THE FLIP SIDE: equal shares also means a small show gets as much airtime as a big one.
+  # National Geographic Explorer has ONE episode and would have aired more often than any
+  # episode of Friends. The documentary series were moved to the DOCUMENTARY slot for exactly
+  # this reason. Three tiny groups remain because they have nowhere else to go, and repeating
+  # them is judged better than stranding them: Animaniacs (3 episodes, CARTOONS), The Jeff
+  # Dunham Show (1, afternoon and evening) and Fabulous Beasts (2, NIGHT_MIX). If any of them
+  # becomes irritating, name it out of its source — do not switch to play_all_items.
+  #
+  # Note that a playout reset restarts every show at S01E01. That is the right behaviour here,
+  # but it does mean the position is not preserved across the resets needed to deploy changes.
+  - marathon:
+    key: "CARTOONS"
+    searches:
+      - "type:episode AND library_name:\"Cartoons\" AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\" OR show_title:\"Me & Winnie the Pooh\" OR show_title:\"The New Adventures of Jonny Quest\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # Short cartoons for padding and the wind-down. Tom and Jerry and Dexter shorts dominate.
+  - search:
+    key: "SHORT_CARTOONS"
+    query: "type:episode AND library_name:\"Cartoons\" AND minutes:[1 TO 12] AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\" OR show_title:\"Me & Winnie the Pooh\" OR show_title:\"The New Adventures of Jonny Quest\")"
+    order: shuffle
+
+  # 221 episodes: 7th Heaven (199) and Georgie & Mandy's First Marriage (22). Documentaries
+  # are excluded here so they can have their own calmer slot at the end of the day.
+  - marathon:
+    key: "FAMILY_SHOWS"
+    searches:
+      - "type:episode AND library_name:\"TV Series\" AND show_genre:family NOT show_genre:documentary AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # 129 episodes: How It's Made (104, TV-G) and Planet Earth I/II/III (25). A deliberate
+  # wind-down before off air. The `family` genre requirement was dropped from this query
+  # because How It's Made carries `documentary` as its only genre and was unreachable
+  # otherwise; the rating allow-list is what keeps the block child-safe, not the genre.
+  - marathon:
+    key: "NATURE"
+    searches:
+      - "type:episode AND library_name:\"TV Series\" AND show_genre:documentary AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  # 52 films: 50 from Movies with animation/family/children genres, plus 2 from Animated.
+  - search:
+    key: "KIDS_MOVIES"
+    query: "type:movie AND (library_name:\"Animated\" OR library_name:\"Movies\") AND (genre:animation OR genre:family OR genre:children) AND minutes:[60 TO 400] AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6))"
+    order: shuffle
+
+reset:
+  - wait_until: "07:00"
+    tomorrow: false
+    rewind_on_reset: true
+
+playout:
+  - wait_until: "07:00"
+    tomorrow: false
+
+  - pad_until: "15:00"
+    tomorrow: false
+    content: "CARTOONS"
+    discard_attempts: 3
+
+  - pad_until: "14:45"
+    tomorrow: false
+    content: "CARTOONS"
+    stop_before_end: false
+
+  # Late afternoon shifts to live-action family shows, the way after-school scheduling used
+  # to work.
+  - pad_until: "18:00"
+    tomorrow: false
+    content: "FAMILY_SHOWS"
+    discard_attempts: 3
+
+  - pad_until: "17:45"
+    tomorrow: false
+    content: "FAMILY_SHOWS"
+    stop_before_end: false
+
+  # One family feature, whole.
+  - count: 1
+    content: "KIDS_MOVIES"
+
+  - pad_until: "20:30"
+    tomorrow: false
+    content: "SHORT_CARTOONS"
+    discard_attempts: 3
+
+  - pad_until: "20:15"
+    tomorrow: false
+    content: "SHORT_CARTOONS"
+    stop_before_end: false
+
+  - pad_until: "21:00"
+    tomorrow: false
+    content: "NATURE"
+    discard_attempts: 2
+
+  - pad_until: "20:45"
+    tomorrow: false
+    content: "NATURE"
+    stop_before_end: false
+
+  # Shorts overnight. `stop_before_end: false` lets the last one run past 07:00, by at most
+  # one short, so the following `wait_until: "07:00"` is a no-op. It replaced
+  # `offline_tail: true`, which held the last few minutes before 07:00 off air.
+  - pad_until: "07:00"
+    tomorrow: true
+    content: "SHORT_CARTOONS"
+    stop_before_end: false
+
+  - repeat: true
+
+# Note: no gaps, by user rule on 2026-11-19. Each boundary T is a pad to T of whole items,
+# then a pad to T minus 15 from the same block with `stop_before_end: false`. A remainder of
+# 15 minutes or less lets the next block start that much early; a longer one gets one more
+# item from the ending block, which runs over T. Episodes always play whole. Not `fallback`,
+# which loops a single item over the whole gap (an Animaniacs episode four times in a row on
+# 2026-11-19). The full reasoning is in main.yml.

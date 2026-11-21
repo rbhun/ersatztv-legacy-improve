@@ -1,0 +1,92 @@
+# Hungarian-preferring stream selector.
+#
+# Deploy to:  /opt/ersatztv/config/scripts/channel-stream-selectors/stream-selector-hu.yml
+# Then set the channel's `Stream Selector Mode` to Custom and pick this file.
+#
+# HOW IT WORKS
+#   Items are tested top to bottom against each media item. BOTH the audio and the subtitle
+#   criteria of a single item must match for selection to finalize — a matching audio in item
+#   1 will not borrow the subtitle rule from item 2. If the audio matches but the subtitle
+#   criteria find nothing, the whole item fails and testing continues at the next one.
+#
+#   `hu*` is a wildcard, so it matches both `hu` and `hun`. That matters: tagging is
+#   inconsistent across this library.
+#
+# WHY THE FALLBACK CHAIN IS THIS LONG
+#   A large share of this library has NO audio language tag at all — 175 of 919 films, at
+#   least 1200 of 2584 TV episodes, and around 340 of 422 cartoon episodes. An untagged stream
+#   cannot match `hu*` or `en*`, so without the catch-all at the bottom there would be content
+#   for which no audio is ever selected.
+#
+# ─── WHY ITEM 4 LISTS LANGUAGES INSTEAD OF USING `*` ──────────────────────────
+# This used to be `audio_language: ["*"]` with `subtitle_language: ["hu*"]`, meaning "some
+# third language, give it Hungarian subtitles". That was wrong, and it produced a visible bug:
+# Hungarian subtitles burned over Hungarian audio.
+#
+# A wildcard cannot tell a third language apart from an untagged stream. `Wrongfully Accused`
+# (`Sziki-szökevény_hun.avi`) is the worked example — one audio track that Plex reports as
+# `Unknown (MP3 Stereo)` with no language tag, plus an external `hu` subtitle. It is a
+# Hungarian dub. Items 1 to 3 need a `hu` or `en` tag and an untagged track matches neither,
+# so it fell to the wildcard and had the Hungarian subtitle burned over the Hungarian dub.
+#
+# Five of the 28 films in the current Filmek guide are in exactly this state: Eyes Wide Shut,
+# Fantasia 2000, French Kiss, Top Gun: Maverick, Wrongfully Accused.
+#
+# So item 4 is now an ALLOW-LIST of real language tags, the same principle already used for
+# content ratings elsewhere in this repo. Anything carrying a genuine language tag is known
+# not to be Hungarian and genuinely needs subtitles; anything untagged is unknown and falls to
+# the catch-all, which plays no subtitles. On this channel that is the safe direction: an
+# untagged file that reached a Hungarian channel is more likely a dub than not, and no
+# subtitles beats the wrong ones.
+#
+# The list below is measured from the library, not guessed — every tag that actually appears
+# on a film here (fr 52, it 39, es 39, de 24, ru 15, cs 19, pl 14, pt 10, ja 9, th 4, tr 4,
+# da 2, sv 2, hi 2, ar 1, zh 1, sk 1), plus common European tags so a new arrival does not
+# need an edit. `zxx` means "no linguistic content" and is on the silent films, which need
+# subtitles more than anything else here.
+#
+# THE REAL FIX IS TO TAG THE AUDIO. `mkvpropedit` can set a track language in place without
+# re-encoding. Once a dub is tagged `hu` it matches item 1, gets no subtitles, and none of the
+# guesswork above applies.
+#
+# ─── SUBTITLES ARE BURNED IN ──────────────────────────────────────────────────
+# ErsatzTV burns the selected subtitle into the picture; it is never offered as a track. So a
+# wrong choice here is not something the viewer can switch off from the sofa.
+
+items:
+  # 1. Hungarian audio. Nothing to read, so no subtitles.
+  - audio_language: ["hu*"]
+    disable_subtitles: true
+
+  # 2. Untagged tracks that NAME their language in the title. Some releases here carry no
+  #    audio language tags at all and only *title* the tracks, in Hungarian — `magyar`,
+  #    `angol`, `francia`. `audio_title_allowlist` discards streams whose title contains none
+  #    of these, which isolates the dub by name. 93 episodes have a Hungarian-titled track.
+  #    This sits above the English items on purpose: on this channel a named Hungarian track
+  #    should win over a tagged English one.
+  - audio_language: ["*"]
+    audio_title_allowlist: ["magyar", "hungarian", "hun"]
+    disable_subtitles: true
+
+  # 3. No Hungarian dub, but English audio exists — pair it with Hungarian subtitles.
+  #    361 films and 433 TV episodes carry a Hungarian subtitle track.
+  - audio_language: ["en*"]
+    subtitle_language: ["hu*"]
+
+  # 4. English audio, no Hungarian subtitles available. Better than nothing.
+  - audio_language: ["en*"]
+    disable_subtitles: true
+
+  # 5. A genuinely tagged third language — Hungarian subtitles. See the note above for why
+  #    this is a list and not `*`. Do not replace it with a wildcard.
+  - audio_language: ["fr*", "it*", "es*", "de*", "ru*", "cs*", "pl*", "pt*", "ja*", "th*",
+                     "tr*", "da*", "sv*", "hi*", "ar*", "zh*", "sk*", "nl*", "no*", "fi*",
+                     "ro*", "el*", "he*", "ko*", "hr*", "sr*", "uk*", "bg*", "sl*", "zxx"]
+    subtitle_language: ["hu*"]
+
+  # 6. Catch-all, and the fix for the bug described above. Reached by untagged audio and by
+  #    tagged foreign audio that has no Hungarian subtitle. No subtitles either way.
+  #    Also required for the untagged majority of the cartoons — without it, those items
+  #    would get no audio stream selected at all.
+  - audio_language: ["*"]
+    disable_subtitles: true

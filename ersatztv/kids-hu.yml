@@ -1,0 +1,159 @@
+# ErsatzTV Sequential Schedule — "Kids & Family HU"
+#
+# Same dayparting as kids.yml. See that file for the safety reasoning behind selecting
+# cartoons by library rather than by `genre:animation` (Archer), and for how the boundaries
+# are closed without gaps; it is not repeated here.
+#
+# ─── THE CARTOON SOURCES ARE DELIBERATELY NOT LANGUAGE-FILTERED ───────────────
+# This is the one place where filtering would do harm. Around 340 of the 422 cartoon episodes
+# carry no audio language tag, and they are overwhelmingly dialogue-free slapstick — Tom and
+# Jerry, Dexter shorts. Those episodes belong on a Hungarian channel and an English one
+# equally, because there is nothing in them to dub.
+#
+# Applying `language_tag:hu*` here would cut 422 episodes to 57 and throw away the eight-hour
+# morning block to solve a problem those files do not have. So CARTOONS and SHORT_CARTOONS
+# stay open, and the stream selector picks a Hungarian track whenever one exists.
+#
+# The cost is honest and small: roughly 25 cartoon episodes are tagged English-only and will
+# air in English here. If that bothers you, add `NOT language_tag:en*` to the two cartoon
+# queries — but be aware it also drops dual-audio files that contain a Hungarian track
+# alongside the English one, which are the best content on the channel.
+#
+# ─── ONLY THE FEATURE FILM IS LANGUAGE-FILTERED ───────────────────────────────
+# KIDS_MOVIES gets `AND language_tag:hu*`, because a dubbed film is the one slot where it both
+# matters most and is actually achievable: 28 films qualify, which is a month of daily features
+# before anything repeats.
+#
+# FAMILY_SHOWS and NATURE are left unfiltered, which was a deliberate trade rather than an
+# oversight. `show_genre:family AND language_tag:hu*` returns six episodes of a single show
+# across the whole library, so filtering here would empty a three-hour afternoon block to
+# protect a pool that does not exist. Subtitles are not an alternative for young children, so
+# the choice was an English 7th Heaven or no afternoon block at all, and English won.
+#
+# If dubbed family shows are ever added to the library, add `AND language_tag:hu*` to both
+# queries below and the block becomes genuinely Hungarian with no other change needed.
+
+content:
+  # ─── MARATHON, NOT SHUFFLE — TWO PROBLEMS, ONE FIX ───────────────────────────
+  # A `search` source with `order: shuffle` picks items at random from a flat pool, which
+  # caused both of the complaints about this channel at once.
+  #
+  # Episodes came out jumbled: 7th Heaven ran S01E10, S09E11, S02E06, S04E11 in a single day.
+  # And airtime followed POOL SIZE, so Top Gear's 226 episodes bought it 30% of the pre-14:00
+  # block and 7th Heaven's 200 another 20% — four shows were three quarters of the day.
+  #
+  # A marathon grouped by show fixes both. `item_order: chronological` means each show
+  # advances S01E01, S01E02, S01E03 across days, and `play_all_items: false` means one
+  # episode is taken from a show before moving to the next, so every show gets an EQUAL share
+  # of slots no matter how many episodes it owns. Top Gear goes from 30% to 1/n.
+  # `shuffle_groups: true` randomises which show is up next, so the running order is not a
+  # fixed rotation.
+  #
+  #
+  # THE FLIP SIDE: equal shares also means a small show gets as much airtime as a big one.
+  # National Geographic Explorer has ONE episode and would have aired more often than any
+  # episode of Friends. The documentary series were moved to the DOCUMENTARY slot for exactly
+  # this reason. Three tiny groups remain because they have nowhere else to go, and repeating
+  # them is judged better than stranding them: Animaniacs (3 episodes, CARTOONS), The Jeff
+  # Dunham Show (1, afternoon and evening) and Fabulous Beasts (2, NIGHT_MIX). If any of them
+  # becomes irritating, name it out of its source — do not switch to play_all_items.
+  #
+  # Note that a playout reset restarts every show at S01E01. That is the right behaviour here,
+  # but it does mean the position is not preserved across the resets needed to deploy changes.
+  - marathon:
+    key: "CARTOONS"
+    searches:
+      - "type:episode AND library_name:\"Cartoons\" AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\" OR show_title:\"Me & Winnie the Pooh\" OR show_title:\"The New Adventures of Jonny Quest\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  - search:
+    key: "SHORT_CARTOONS"
+    query: "type:episode AND library_name:\"Cartoons\" AND minutes:[1 TO 12] AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\" OR show_title:\"Me & Winnie the Pooh\" OR show_title:\"The New Adventures of Jonny Quest\")"
+    order: shuffle
+
+  - marathon:
+    key: "FAMILY_SHOWS"
+    searches:
+      - "type:episode AND library_name:\"TV Series\" AND show_genre:family NOT show_genre:documentary AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  - marathon:
+    key: "NATURE"
+    searches:
+      - "type:episode AND library_name:\"TV Series\" AND show_genre:documentary AND (show_content_rating:\"TV-G\" OR show_content_rating:\"TV-Y\" OR show_content_rating:\"TV-Y7\" OR show_content_rating:\"TV-PG\")"
+    group_by: "show"
+    item_order: "chronological"
+    play_all_items: false
+    shuffle_groups: true
+
+  - search:
+    key: "KIDS_MOVIES"
+    query: "type:movie AND (library_name:\"Animated\" OR library_name:\"Movies\") AND (genre:animation OR genre:family OR genre:children) AND minutes:[60 TO 400] AND language_tag:hu* AND (content_rating:\"G\" OR content_rating:(hu AND KN) OR content_rating:(hu AND 6))"
+    order: shuffle
+
+reset:
+  - wait_until: "07:00"
+    tomorrow: false
+    rewind_on_reset: true
+
+playout:
+  - wait_until: "07:00"
+    tomorrow: false
+
+  - pad_until: "15:00"
+    tomorrow: false
+    content: "CARTOONS"
+    discard_attempts: 3
+
+  - pad_until: "14:45"
+    tomorrow: false
+    content: "CARTOONS"
+    stop_before_end: false
+
+  - pad_until: "18:00"
+    tomorrow: false
+    content: "FAMILY_SHOWS"
+    discard_attempts: 3
+
+  - pad_until: "17:45"
+    tomorrow: false
+    content: "FAMILY_SHOWS"
+    stop_before_end: false
+
+  - count: 1
+    content: "KIDS_MOVIES"
+
+  - pad_until: "20:30"
+    tomorrow: false
+    content: "SHORT_CARTOONS"
+    discard_attempts: 3
+
+  - pad_until: "20:15"
+    tomorrow: false
+    content: "SHORT_CARTOONS"
+    stop_before_end: false
+
+  - pad_until: "21:00"
+    tomorrow: false
+    content: "NATURE"
+    discard_attempts: 2
+
+  - pad_until: "20:45"
+    tomorrow: false
+    content: "NATURE"
+    stop_before_end: false
+
+  # Overnight shorts run past 07:00 by up to one short, so there is no off-air tail before
+  # `wait_until: "07:00"`. See kids.yml.
+  - pad_until: "07:00"
+    tomorrow: true
+    content: "SHORT_CARTOONS"
+    stop_before_end: false
+
+  - repeat: true
