@@ -7,11 +7,9 @@
 #   sudo bash deploy/target/bootstrap.sh [git-url]
 #
 # Creates:
-#   /opt/ersatztv-deploy     public git checkout
+#   /opt/ersatztv-deploy     public git checkout (schedules + patches + deploy)
 #   /opt/ersatztv/local/     personal overlay (env + optional schedule overrides)
 #   /opt/ersatztv/config/    ErsatzTV bind-mount (left alone if it already exists)
-#
-# Does not destroy an existing /opt/ersatztv/config database.
 set -euo pipefail
 
 REPO_URL="${1:-https://github.com/rbhun/ersatztv-legacy-improve.git}"
@@ -40,7 +38,6 @@ echo "==> preparing ${ETV_DIR}/local overlay"
 mkdir -p "${ETV_DIR}/config" "${ETV_DIR}/local"
 if [ ! -f "${ETV_DIR}/local/env" ]; then
     cp -R "${DEPLOY_DIR}/deploy/local.example/." "${ETV_DIR}/local/"
-    # Detect timezone and render node when possible.
     TZ_VALUE=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo Europe/Budapest)
     RENDER_NODE=""
     if [ -e /dev/dri/renderD128 ]; then
@@ -58,14 +55,12 @@ if [ ! -f "${ETV_DIR}/local/env" ]; then
     sed -i "s|^RENDER_NODE=.*|RENDER_NODE=${RENDER_NODE}|" "${ETV_DIR}/local/env" 2>/dev/null \
         || sed -i '' "s|^RENDER_NODE=.*|RENDER_NODE=${RENDER_NODE}|" "${ETV_DIR}/local/env"
     echo "    wrote ${ETV_DIR}/local/env (TZ=${TZ_VALUE}, RENDER_NODE=${RENDER_NODE})"
-    echo "    edit that file before the first update if the forks or image name differ"
 else
     echo "    keeping existing ${ETV_DIR}/local/env"
 fi
 
 chmod +x "${DEPLOY_DIR}/deploy/target/"*.sh
 
-# Convenience wrapper on PATH.
 cat > /usr/local/bin/ersatztv-update <<EOF
 #!/bin/sh
 exec ${DEPLOY_DIR}/deploy/target/update.sh "\$@"
@@ -78,11 +73,8 @@ Bootstrap complete.
 
 Next:
   1. Review ${ETV_DIR}/local/env
-  2. Ensure the public forks exist and match ETV_REPO / NEXT_REPO:
-       ${REPO_URL%/ersatztv-legacy-improve.git}/ersatztv
-       ${REPO_URL%/ersatztv-legacy-improve.git}/ersatztv-next
-  3. Run:  ersatztv-update
-     (pulls this repo, builds the fork image, applies schedules, restarts)
+  2. Run:  ersatztv-update
+     (pulls this repo, clones upstream + applies patches/, builds image, applies schedules)
 
 Local schedule overrides go in ${ETV_DIR}/local/schedules/ (same filenames as the public
 ersatztv/*.yml files). Anything there wins over the public defaults on every update.

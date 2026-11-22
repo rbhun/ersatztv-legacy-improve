@@ -14,6 +14,9 @@ tokens, API keys or library file listings; use `plex.internal` or `<host>` place
 
 - `ersatztv/*.yml`: the six sequential schedules, two stream selectors and graphics. Public
   defaults. On the target they land under `/opt/ersatztv/config/` via `deploy/target/apply-overlay.sh`.
+- `patches/legacy/`, `patches/next/`: all code improvements as patch series on upstream tags
+  pinned in `versions.env`. The build clones upstream and applies these — do not vendor full
+  trees here.
 - `deploy/`: GitHub-pull deploy. Target checkout is `/opt/ersatztv-deploy`. Personal data lives in
   `/opt/ersatztv/local/` (never committed). See `deploy/README.md`.
 - `ersatztv/audit/`: library inventory snapshots that the checkers read. Local only (gitignored);

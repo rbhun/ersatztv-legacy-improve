@@ -1,0 +1,793 @@
+From 3a635f26e934bd111874ee0501e22239ed3d2871 Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Thu, 19 Nov 2026 14:55:12 +0100
+Subject: [PATCH] feat: output multiple audio tracks
+
+Add normalization.audio.tracks to the channel config (schema 0.1.6) and
+tracks.extra_audio to playout items (schema 0.0.9). Extra tracks read from
+the primary audio input, get the same audio filters and are tagged with
+their language and title; slots an item can't fill are silent so the track
+layout never changes between items.
+
+Scope the forced ac3 downmix decoder to the primary stream so other audio
+streams in the same input keep their own decoder.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ CHANGELOG.md                                  |   7 +
+ .../ersatztv-channel/src/channel_session.rs   |  21 +-
+ crates/ersatztv-channel/src/config.rs         |  16 +-
+ .../src/generate.rs                           |   3 +
+ crates/ersatztv-playout/src/playout.rs        |  14 +-
+ crates/ffpipeline/src/audio_decoder.rs        |  10 +-
+ crates/ffpipeline/src/filter_chain.rs         |  11 +
+ crates/ffpipeline/src/input.rs                |   3 +
+ crates/ffpipeline/src/output_settings.rs      |  11 +
+ crates/ffpipeline/src/pipeline.rs             | 229 +++++++++++++++++-
+ crates/ffpipeline/tests/common/mod.rs         |   2 +
+ examples/channel.json                         |   2 +-
+ examples/channel_copy.json                    |   2 +-
+ examples/playout/playout.json                 |   2 +-
+ schema/channel_config.json                    |  30 ++-
+ schema/playout.json                           |  24 +-
+ 16 files changed, 368 insertions(+), 19 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6fe3973..29363ac 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ (`0.B.C`, the same rule as the [config versions](https://ersatztv.org/next-docs/configuration/versions)).
+ 
+ ## [Unreleased]
++### Added
++- Add `normalization.audio.tracks` to `channel.json` to output multiple audio tracks (channel config schema `0.1.6`)
++  - Each entry sets a track's `language` and `title`; the first describes the primary track
++  - Fill the extra tracks per item with `tracks.extra_audio` in the playout (playout schema `0.0.9`); unfilled tracks are silent, so every item has the same layout
++
++### Fixed
++- Fix decoding a second audio stream from a source whose primary audio track is downmixed 5.1 AC-3
+ 
+ ## [0.2.7] - 2026-11-20
+ ### Fixed
+diff --git a/crates/ersatztv-channel/src/channel_session.rs b/crates/ersatztv-channel/src/channel_session.rs
+index 1924a7b..fc4f49c 100644
+--- a/crates/ersatztv-channel/src/channel_session.rs
++++ b/crates/ersatztv-channel/src/channel_session.rs
+@@ -31,8 +31,8 @@ use ffpipeline::keyframe_seek::{
+     CopySeekRequest, InputStart, Keyframe, KeyframeLocator, plan_copy_seek,
+ };
+ use ffpipeline::output_settings::{
+-    AudioOutputSettings, AudioTranscodeSettings, CopyPolicy, OutputSettings, SubtitleMode,
+-    VideoOutputSettings, VideoTranscodeSettings,
++    AudioOutputSettings, AudioTrackMetadata, AudioTranscodeSettings, CopyPolicy, OutputSettings,
++    SubtitleMode, VideoOutputSettings, VideoTranscodeSettings,
+ };
+ use ffpipeline::pipeline::{Hz, Kbps, PtsOffset, SEGMENT_SECONDS};
+ use ffpipeline::probe::{
+@@ -736,6 +736,12 @@ impl ChannelSession {
+             .and_then(|t| t.audio.as_ref())
+             .and_then(|a| a.stream_index);
+ 
++        let extra_audio_indices = current_item
++            .tracks
++            .as_ref()
++            .map(|t| t.extra_audio.iter().map(|a| a.stream_index).collect())
++            .unwrap_or_default();
++
+         let subtitle_index = current_item
+             .tracks
+             .as_ref()
+@@ -791,6 +797,7 @@ impl ChannelSession {
+             channel_number: Some(self.channel_config.number().to_owned()),
+             video_copy_seek: None,
+             video_copy_blockers: Vec::new(),
++            extra_audio_indices,
+         };
+ 
+         let window = input_settings.duration();
+@@ -1896,6 +1903,7 @@ fn fallback_item(
+                 stream_index: None,
+             }),
+             subtitle,
++            extra_audio: Vec::new(),
+         }),
+         watermark: None,
+         graphics: Vec::new(),
+@@ -1972,6 +1980,14 @@ fn stream_output_settings(
+                 None
+             },
+         },
++        tracks: audio_norm
++            .tracks
++            .iter()
++            .map(|t| AudioTrackMetadata {
++                language: t.language.clone(),
++                title: t.title.clone(),
++            })
++            .collect(),
+     };
+ 
+     let video = VideoOutputSettings {
+@@ -2317,6 +2333,7 @@ mod tests {
+             channel_number: None,
+             video_copy_seek: None,
+             video_copy_blockers: Vec::new(),
++            extra_audio_indices: Vec::new(),
+         };
+         let output = OutputSettings {
+             audio,
+diff --git a/crates/ersatztv-channel/src/config.rs b/crates/ersatztv-channel/src/config.rs
+index 2441e63..747d20f 100644
+--- a/crates/ersatztv-channel/src/config.rs
++++ b/crates/ersatztv-channel/src/config.rs
+@@ -14,7 +14,7 @@ use crate::error::{ChannelError, IoContext};
+ 
+ pub const SUPPORTED_SCHEMA: SchemaVersion = SchemaVersion {
+     breaking: 1,
+-    compatible: 5,
++    compatible: 6,
+ };
+ pub const SCHEMA: VersionedSchema =
+     VersionedSchema::new("https://ersatztv.org/channel/version/", SUPPORTED_SCHEMA);
+@@ -234,6 +234,20 @@ pub struct AudioNormalizationConfig {
+     pub normalize_loudness: bool,
+     /// Targets for `normalize_loudness`.
+     pub loudness: Option<AudioLoudnessConfig>,
++    /// Audio tracks to output, in order. The first entry describes the primary track; each
++    /// further entry adds a track filled from the playout item's `tracks.extra_audio`, or with
++    /// silence, so every item has the same layout. Empty outputs one untagged track.
++    #[serde(default)]
++    pub tracks: Vec<AudioTrackConfig>,
++}
++
++#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
++#[schemars(title = "AudioTrack")]
++pub struct AudioTrackConfig {
++    /// Language tag for the track, e.g. `eng`.
++    pub language: Option<String>,
++    /// Track title shown in players, e.g. `English`.
++    pub title: Option<String>,
+ }
+ 
+ #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
+diff --git a/crates/ersatztv-playout-generator/src/generate.rs b/crates/ersatztv-playout-generator/src/generate.rs
+index ddfbfac..c01d9c6 100644
+--- a/crates/ersatztv-playout-generator/src/generate.rs
++++ b/crates/ersatztv-playout-generator/src/generate.rs
+@@ -285,6 +285,7 @@ async fn build_items(
+                         stream_index: None,
+                     }),
+                     subtitle: None,
++                    extra_audio: Vec::new(),
+                 });
+ 
+                 playout_item.source = None;
+@@ -302,6 +303,7 @@ async fn build_items(
+                                 source: None,
+                                 stream_index: Some(video_stream.stream_index),
+                             }),
++                            extra_audio: Vec::new(),
+                         })
+                     }
+                 }
+@@ -336,6 +338,7 @@ async fn build_items(
+                                 }),
+                                 stream_index: None,
+                             }),
++                            extra_audio: Vec::new(),
+                         });
+                         break;
+                     }
+diff --git a/crates/ersatztv-playout/src/playout.rs b/crates/ersatztv-playout/src/playout.rs
+index f59def2..f039f7b 100644
+--- a/crates/ersatztv-playout/src/playout.rs
++++ b/crates/ersatztv-playout/src/playout.rs
+@@ -14,7 +14,7 @@ pub const DATE_FORMAT: Iso8601<DATE_CONFIG> = Iso8601::<DATE_CONFIG>;
+ 
+ pub const SUPPORTED_SCHEMA: SchemaVersion = SchemaVersion {
+     breaking: 0,
+-    compatible: 8,
++    compatible: 9,
+ };
+ pub const SCHEMA: VersionedSchema =
+     VersionedSchema::new("https://ersatztv.org/playout/version/", SUPPORTED_SCHEMA);
+@@ -103,6 +103,14 @@ pub struct PlayoutItemTracks {
+     pub video: Option<TrackSelection>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub subtitle: Option<TrackSelection>,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub extra_audio: Vec<ExtraAudioTrack>,
++}
++
++#[derive(Debug, Deserialize, Serialize)]
++pub struct ExtraAudioTrack {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub stream_index: Option<u32>,
+ }
+ 
+ #[derive(Debug, Deserialize, Serialize)]
+@@ -857,7 +865,7 @@ mod tests {
+     async fn newer_schema_is_rejected_with_supported_version() {
+         let dir = tempfile::tempdir().unwrap();
+         let path = dir.path().join("playout.json");
+-        let newer = "https://ersatztv.org/playout/version/0.0.9";
++        let newer = "https://ersatztv.org/playout/version/0.0.10";
+         let value = serde_json::json!({ "version": newer, "items": [] });
+         tokio::fs::write(&path, serde_json::to_vec(&value).unwrap())
+             .await
+@@ -869,7 +877,7 @@ mod tests {
+                 supported,
+             })) => {
+                 assert_eq!(found, newer);
+-                assert_eq!(supported, "https://ersatztv.org/playout/version/0.0.8");
++                assert_eq!(supported, "https://ersatztv.org/playout/version/0.0.9");
+             }
+             other => panic!("expected Unsupported, got {:?}", other.err()),
+         }
+diff --git a/crates/ffpipeline/src/audio_decoder.rs b/crates/ffpipeline/src/audio_decoder.rs
+index b816684..2721e59 100644
+--- a/crates/ffpipeline/src/audio_decoder.rs
++++ b/crates/ffpipeline/src/audio_decoder.rs
+@@ -3,6 +3,7 @@ use crate::output_settings::OutputSettings;
+ use crate::probe::ProbeResultAudioStream;
+ 
+ pub struct AudioDecoder {
++    stream_index: u32,
+     input_codec: String,
+     input_channels: u32,
+     output_channels: Option<u32>,
+@@ -14,6 +15,7 @@ impl AudioDecoder {
+         output_settings: &OutputSettings,
+     ) -> AudioDecoder {
+         AudioDecoder {
++            stream_index: audio_stream.stream_index,
+             input_codec: audio_stream.codec.to_owned(),
+             input_channels: audio_stream.channels,
+             output_channels: output_settings.audio.transcode.channels,
+@@ -22,7 +24,13 @@ impl AudioDecoder {
+ 
+     pub(crate) fn as_arg(&self) -> ArgVec {
+         if self.input_codec == "ac3" && self.input_channels > 2 && self.output_channels == Some(2) {
+-            return args!["-acodec", "ac3", "-downmix", "stereo"];
++            // scoped to this stream so other audio streams read from the same input keep their decoder
++            return args![
++                format!("-c:{}", self.stream_index),
++                "ac3",
++                "-downmix",
++                "stereo"
++            ];
+         }
+ 
+         Vec::new()
+diff --git a/crates/ffpipeline/src/filter_chain.rs b/crates/ffpipeline/src/filter_chain.rs
+index 8f1854b..452787b 100644
+--- a/crates/ffpipeline/src/filter_chain.rs
++++ b/crates/ffpipeline/src/filter_chain.rs
+@@ -897,6 +897,17 @@ impl FilterChain {
+         &self.audio_label
+     }
+ 
++    /// The primary audio filter steps, so extra audio tracks get the same processing.
++    pub(crate) fn audio_filter_args(&self) -> Vec<String> {
++        self.filters
++            .iter()
++            .filter_map(|f| match f {
++                PipelineFilter::Audio(audio_filter) => audio_filter.as_arg(),
++                _ => None,
++            })
++            .collect()
++    }
++
+     pub(crate) fn video_label(&self) -> &str {
+         &self.video_label
+     }
+diff --git a/crates/ffpipeline/src/input.rs b/crates/ffpipeline/src/input.rs
+index 6c887ed..f72a197 100644
+--- a/crates/ffpipeline/src/input.rs
++++ b/crates/ffpipeline/src/input.rs
+@@ -28,6 +28,9 @@ pub struct InputSettings {
+     pub video_copy_seek: Option<CopySeek>,
+     /// Blockers that need a dry run, so only the caller can find them
+     pub video_copy_blockers: Vec<CopyBlocker>,
++    /// Source stream for each audio track after the primary, read from `audio_input`.
++    /// `None`, or an index the source doesn't have, fills that track with silence.
++    pub extra_audio_indices: Vec<Option<u32>>,
+ }
+ 
+ impl InputSettings {
+diff --git a/crates/ffpipeline/src/output_settings.rs b/crates/ffpipeline/src/output_settings.rs
+index e0bdede..eff617b 100644
+--- a/crates/ffpipeline/src/output_settings.rs
++++ b/crates/ffpipeline/src/output_settings.rs
+@@ -158,6 +158,17 @@ pub struct AudioOutputSettings {
+     /// `None` always transcodes
+     pub copy: Option<CopyPolicy<String>>,
+     pub transcode: AudioTranscodeSettings,
++    /// Output audio tracks in order. The first entry describes the primary track; each further
++    /// entry adds a track filled from `InputSettings::extra_audio_indices` or with silence.
++    /// Empty outputs only the primary track, without metadata.
++    pub tracks: Vec<AudioTrackMetadata>,
++}
++
++#[derive(Debug, Clone, Default)]
++pub struct AudioTrackMetadata {
++    /// ISO 639-2 language code written to the stream, e.g. `eng`.
++    pub language: Option<String>,
++    pub title: Option<String>,
+ }
+ 
+ #[derive(Debug)]
+diff --git a/crates/ffpipeline/src/pipeline.rs b/crates/ffpipeline/src/pipeline.rs
+index 739417e..410e2d1 100644
+--- a/crates/ffpipeline/src/pipeline.rs
++++ b/crates/ffpipeline/src/pipeline.rs
+@@ -22,12 +22,12 @@ use crate::global_option::{GlobalOption, LogLevel};
+ use crate::hw_accel::{HardwareAccel, HwAccel};
+ use crate::input::{
+     CanvasLayout, FfmpegInputArgs, FfmpegInputRequestContext, GraphicsInput, GraphicsKind,
+-    InputSettings, InputSource, LocalInputSource, ProbedInput,
++    InputSettings, InputSource, LavfiInputSource, LocalInputSource, ProbedInput,
+ };
+ use crate::output_format::gop_frames;
+ use crate::output_option::OutputOption;
+ use crate::output_settings::{
+-    OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions, YadifOptions,
++    AudioTrackMetadata, OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions, YadifOptions,
+ };
+ use crate::overlay_filter::{
+     FramePoint, OverlayFilter, OverlayKind, OverlaySource, SoftwareOverlay,
+@@ -619,6 +619,16 @@ pub struct EnvironmentVariable {
+     pub value: String,
+ }
+ 
++/// Where an audio track after the primary comes from.
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) enum ExtraAudioSource {
++    /// A stream in the primary audio input.
++    Stream(u32),
++    Silence,
++}
++
++const EXTRA_AUDIO_SILENCE: &str = "anullsrc=channel_layout=stereo:sample_rate=48000";
++
+ pub struct Pipeline {
+     ffmpeg_info: FfmpegInfo,
+     copy_decisions: CopyDecisions,
+@@ -632,6 +642,11 @@ pub struct Pipeline {
+     output_options: Vec<OutputOption>,
+     env_vars: Vec<EnvironmentVariable>,
+ 
++    extra_audio: Vec<ExtraAudioSource>,
++    audio_tracks: Vec<AudioTrackMetadata>,
++    /// Encodes silent extra tracks when the primary audio is copied.
++    silence_codec: AudioCodec,
++
+     input_request_context: FfmpegInputRequestContext,
+     output_context: OutputContext,
+ }
+@@ -652,6 +667,22 @@ impl Pipeline {
+             input_settings.audio_input = silence;
+         }
+ 
++        let extra_audio: Vec<ExtraAudioSource> = (1..final_output_settings.audio.tracks.len())
++            .map(|track| {
++                input_settings
++                    .extra_audio_indices
++                    .get(track - 1)
++                    .copied()
++                    .flatten()
++                    .filter(|index| {
++                        input_settings.audio_input.probe_result.streams.iter().any(|s| {
++                            matches!(s, ProbeResultStream::Audio(a) if a.stream_index == *index)
++                        })
++                    })
++                    .map_or(ExtraAudioSource::Silence, ExtraAudioSource::Stream)
++            })
++            .collect();
++
+         if let Some(accel) = &final_output_settings.accel
+             && accel
+                 .known_accel()
+@@ -1375,6 +1406,12 @@ impl Pipeline {
+             input_request_context,
+             output_context,
+             env_vars,
++            extra_audio,
++            silence_codec: match final_output_settings.audio.transcode.format {
++                AudioFormat::Aac => AudioCodec::Aac,
++                AudioFormat::Ac3 => AudioCodec::Ac3,
++            },
++            audio_tracks: final_output_settings.audio.tracks.clone(),
+         })
+     }
+ 
+@@ -1408,6 +1445,8 @@ impl Pipeline {
+             _ => None,
+         }) && Some(audio_channels) == self.output_context.audio_channels.as_ref()
+             && !aac_surround
++            // extra tracks can have a different channel count than the primary
++            && self.extra_audio.is_empty()
+         {
+             self.output_options
+                 .retain(|o| !matches!(o, OutputOption::AudioChannels(_)));
+@@ -1681,6 +1720,7 @@ impl Pipeline {
+         let mut result: ArgVec = Vec::new();
+ 
+         let mut audio_label = String::from("0:a");
++        let mut audio_input_index_for_extras = 0;
+         let mut video_label = String::from("0:v");
+         let mut subtitle_label = None;
+         let mut graphics_labels = vec![
+@@ -1818,6 +1858,7 @@ impl Pipeline {
+                         }
+                     };
+                     audio_label = format!("{}:{}", audio_input_index, index);
++                    audio_input_index_for_extras = audio_input_index;
+                 }
+                 PipelineInput::Subtitle {
+                     input_source,
+@@ -1873,6 +1914,24 @@ impl Pipeline {
+             }
+         }
+ 
++        let mut extra_audio_labels: Vec<String> = Vec::new();
++        for source in &self.extra_audio {
++            match source {
++                ExtraAudioSource::Stream(index) => {
++                    extra_audio_labels.push(format!("{audio_input_index_for_extras}:{index}"));
++                }
++                ExtraAudioSource::Silence => {
++                    let silence = LavfiInputSource {
++                        params: EXTRA_AUDIO_SILENCE.to_owned(),
++                    };
++                    result.extend(silence.args_for_input());
++                    result.extend(args!["-i", EXTRA_AUDIO_SILENCE]);
++                    input_paths.push(EXTRA_AUDIO_SILENCE);
++                    extra_audio_labels.push(format!("{}:a", input_paths.len() - 1));
++                }
++            }
++        }
++
+         let mut filter_chain = self.filter_chain.to_owned();
+         filter_chain.build(
+             &audio_label,
+@@ -1883,14 +1942,68 @@ impl Pipeline {
+ 
+         result.extend(filter_chain.as_arg());
+ 
++        let audio_filters = filter_chain.audio_filter_args();
++        let mut extra_audio_maps: Vec<String> = Vec::new();
++        let mut extra_audio_filters: Vec<String> = Vec::new();
++        for (n, label) in extra_audio_labels.iter().enumerate() {
++            if audio_filters.is_empty() {
++                extra_audio_maps.push(label.to_owned());
++            } else {
++                let out = format!("[a{}]", n + 1);
++                extra_audio_filters.push(format!("[{label}]{}{out}", audio_filters.join(",")));
++                extra_audio_maps.push(out);
++            }
++        }
++        if !extra_audio_filters.is_empty() {
++            result.extend(args!["-filter_complex", extra_audio_filters.join(";")]);
++        }
++
+         result.extend(args!["-map", filter_chain.video_label().to_owned()]);
+         result.extend(args!["-map", filter_chain.audio_label().to_owned()]);
++        for map in extra_audio_maps {
++            result.extend(args!["-map", map]);
++        }
+ 
+-        result.extend(
+-            self.output_options
+-                .iter()
+-                .flat_map(|o| o.as_arg(&self.output_context)),
+-        );
++        let mut audio_track_args = self.audio_track_args();
++        for option in &self.output_options {
++            // per-track options must come before the output path that `-f` ends with
++            if matches!(option, OutputOption::Format(_)) {
++                result.append(&mut audio_track_args);
++            }
++            result.extend(option.as_arg(&self.output_context));
++        }
++        result.append(&mut audio_track_args);
++
++        result
++    }
++
++    fn audio_track_args(&self) -> ArgVec {
++        let mut result: ArgVec = Vec::new();
++
++        // a lavfi stream can't be copied
++        if self.output_context.audio_codec == AudioCodec::Copy {
++            for (n, source) in self.extra_audio.iter().enumerate() {
++                if *source == ExtraAudioSource::Silence {
++                    let codec = self.silence_codec.as_arg().pop().unwrap_or_default();
++                    result.extend(args![format!("-c:a:{}", n + 1), codec]);
++                }
++            }
++        }
++
++        for (n, track) in self.audio_tracks.iter().enumerate() {
++            if let Some(language) = &track.language {
++                result.extend(args![
++                    format!("-metadata:s:a:{n}"),
++                    format!("language={language}")
++                ]);
++            }
++            if let Some(title) = &track.title {
++                result.extend(args![
++                    format!("-metadata:s:a:{n}"),
++                    format!("title={title}")
++                ]);
++            }
++        }
+ 
+         result
+     }
+@@ -2126,6 +2239,7 @@ mod tests {
+             channel_number: None,
+             video_copy_seek: None,
+             video_copy_blockers: Vec::new(),
++            extra_audio_indices: Vec::new(),
+         }
+     }
+ 
+@@ -2141,6 +2255,7 @@ mod tests {
+                     sample_rate: Some(Hz(48000)),
+                     loudness: None,
+                 },
++                tracks: Vec::new(),
+             },
+             video: crate::output_settings::VideoOutputSettings {
+                 copy: None,
+@@ -3571,4 +3686,104 @@ mod tests {
+         assert!(filter.contains("vpp_qsv="), "{filter}");
+         assert!(!filter.contains("scale_qsv"), "{filter}");
+     }
++
++    fn two_audio_input(extra_audio_indices: Vec<Option<u32>>) -> InputSettings {
++        let mut input = multichannel_ac3_input("main.mkv");
++        let second = crate::probe::ProbeResultStream::Audio(crate::probe::ProbeResultAudioStream {
++            stream_index: 2,
++            codec: "aac".to_owned(),
++            channels: 2,
++        });
++        input.audio_input.probe_result.streams.push(second.clone());
++        input.video_input.probe_result.streams.push(second);
++        input.extra_audio_indices = extra_audio_indices;
++        input
++    }
++
++    fn three_track_output() -> OutputSettings {
++        let mut output = stereo_output();
++        output.audio.tracks = ["eng", "spa", "fre"]
++            .into_iter()
++            .map(|language| AudioTrackMetadata {
++                language: Some(language.to_owned()),
++                title: None,
++            })
++            .collect();
++        output
++    }
++
++    fn arg_pairs(args: &[String]) -> Vec<(String, String)> {
++        args.windows(2)
++            .map(|w| (w[0].clone(), w[1].clone()))
++            .collect()
++    }
++
++    #[test]
++    fn extra_audio_maps_source_streams_and_fills_missing_with_silence() {
++        let input = two_audio_input(vec![Some(2), Some(9)]);
++        let mut pipeline =
++            Pipeline::full(&FfmpegInfo::default(), input, three_track_output()).unwrap();
++        pipeline.optimize();
++        let args: Vec<String> = pipeline.args().iter().map(|a| a.to_string()).collect();
++        let pairs = arg_pairs(&args);
++
++        assert!(pairs.contains(&("-i".to_owned(), EXTRA_AUDIO_SILENCE.to_owned())));
++        // extra tracks get the same audio filters as the primary
++        assert!(
++            args.iter()
++                .any(|a| a.contains("[0:2]aresample=async=1,apad[a1]")
++                    && a.contains("[1:a]aresample=async=1,apad[a2]")),
++            "{args:?}"
++        );
++        assert!(
++            pairs.contains(&("-map".to_owned(), "[a1]".to_owned())),
++            "{args:?}"
++        );
++        assert!(
++            pairs.contains(&("-map".to_owned(), "[a2]".to_owned())),
++            "{args:?}"
++        );
++        assert!(
++            pairs.contains(&("-c:1".to_owned(), "ac3".to_owned())),
++            "{args:?}"
++        );
++        for (n, language) in ["eng", "spa", "fre"].iter().enumerate() {
++            assert!(
++                pairs.contains(&(format!("-metadata:s:a:{n}"), format!("language={language}")))
++            );
++        }
++        // every extra track keeps the channel's audio settings
++        assert!(
++            pairs.contains(&("-ac".to_owned(), "2".to_owned())),
++            "{args:?}"
++        );
++    }
++
++    #[test]
++    fn audio_track_options_precede_output_path() {
++        let input = two_audio_input(vec![Some(2)]);
++        let mut pipeline =
++            Pipeline::full(&FfmpegInfo::default(), input, three_track_output()).unwrap();
++        pipeline.optimize();
++        let args: Vec<String> = pipeline.args().iter().map(|a| a.to_string()).collect();
++
++        let format = args.iter().rposition(|a| a == "-f").unwrap();
++        let last_metadata = args
++            .iter()
++            .rposition(|a| a.starts_with("-metadata:s:a:"))
++            .unwrap();
++        assert!(last_metadata < format, "{args:?}");
++    }
++
++    #[test]
++    fn no_tracks_outputs_single_untagged_audio() {
++        let input = two_audio_input(vec![Some(2)]);
++        let mut pipeline = Pipeline::full(&FfmpegInfo::default(), input, stereo_output()).unwrap();
++        pipeline.optimize();
++        let args: Vec<String> = pipeline.args().iter().map(|a| a.to_string()).collect();
++
++        assert!(!args.iter().any(|a| a.starts_with("-metadata:s:a:")));
++        assert!(!args.contains(&EXTRA_AUDIO_SILENCE.to_owned()));
++        assert!(!args.contains(&"0:2".to_owned()));
++    }
+ }
+diff --git a/crates/ffpipeline/tests/common/mod.rs b/crates/ffpipeline/tests/common/mod.rs
+index 9c6079d..dcfd606 100644
+--- a/crates/ffpipeline/tests/common/mod.rs
++++ b/crates/ffpipeline/tests/common/mod.rs
+@@ -1335,6 +1335,7 @@ pub fn build_input(
+         channel_number: None,
+         video_copy_seek: None,
+         video_copy_blockers: Vec::new(),
++        extra_audio_indices: Vec::new(),
+     }
+ }
+ 
+@@ -1454,6 +1455,7 @@ pub fn build_output(dir: &Path, params: TestOutputParams) -> OutputSettings {
+                 sample_rate: Some(Hz(48000)),
+                 loudness: params.loudness,
+             },
++            tracks: Vec::new(),
+         },
+         video: VideoOutputSettings {
+             copy: params.video_copy,
+diff --git a/examples/channel.json b/examples/channel.json
+index d9b7309..281fbe6 100644
+--- a/examples/channel.json
++++ b/examples/channel.json
+@@ -1,5 +1,5 @@
+ {
+-  "version": "https://ersatztv.org/channel/version/0.1.5",
++  "version": "https://ersatztv.org/channel/version/0.1.6",
+   "playout": {
+     "folder": "./playout"
+   },
+diff --git a/examples/channel_copy.json b/examples/channel_copy.json
+index 082f16d..843ffea 100644
+--- a/examples/channel_copy.json
++++ b/examples/channel_copy.json
+@@ -1,5 +1,5 @@
+ {
+-  "version": "https://ersatztv.org/channel/version/0.1.5",
++  "version": "https://ersatztv.org/channel/version/0.1.6",
+   "playout": {
+     "folder": "./playout"
+   },
+diff --git a/examples/playout/playout.json b/examples/playout/playout.json
+index 7b87a02..6a3c1c9 100644
+--- a/examples/playout/playout.json
++++ b/examples/playout/playout.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "../../schema/playout.json",
+-  "version": "https://ersatztv.org/playout/version/0.0.8",
++  "version": "https://ersatztv.org/playout/version/0.0.9",
+   "items": [
+     {
+       "id": "1",
+diff --git a/schema/channel_config.json b/schema/channel_config.json
+index 4b38296..537ff8e 100644
+--- a/schema/channel_config.json
++++ b/schema/channel_config.json
+@@ -1,5 +1,5 @@
+ {
+-  "$id": "https://ersatztv.org/channel/version/0.1.5",
++  "$id": "https://ersatztv.org/channel/version/0.1.6",
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "title": "ChannelConfig",
+   "description": "Settings for one channel: where its playout is, which ffmpeg to use, and the output format.\nA relative path in any of these settings is relative to the file that sets it.",
+@@ -194,6 +194,34 @@
+           ],
+           "format": "uint32",
+           "minimum": 0
++        },
++        "tracks": {
++          "description": "Audio tracks to output, in order. The first entry describes the primary track; each\nfurther entry adds a track filled from the playout item's `tracks.extra_audio`, or with\nsilence, so every item has the same layout. Empty outputs one untagged track.",
++          "type": "array",
++          "default": [],
++          "items": {
++            "$ref": "#/$defs/AudioTrackConfig"
++          }
++        }
++      }
++    },
++    "AudioTrackConfig": {
++      "title": "AudioTrack",
++      "type": "object",
++      "properties": {
++        "language": {
++          "description": "Language tag for the track, e.g. `eng`.",
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "title": {
++          "description": "Track title shown in players, e.g. `English`.",
++          "type": [
++            "string",
++            "null"
++          ]
+         }
+       }
+     },
+diff --git a/schema/playout.json b/schema/playout.json
+index 0953304..6c7baec 100644
+--- a/schema/playout.json
++++ b/schema/playout.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+-  "$id": "https://ersatztv.org/playout/version/0.0.8",
++  "$id": "https://ersatztv.org/playout/version/0.0.9",
+   "title": "Playout",
+   "description": "A playout schedule for a single time window.\n\nFiles should be named `{start}_{finish}.json` using compact ISO 8601 (no separators), e.g. `20260413T000000.000000000-0500_20260414T002131.620000000-0500.json`, so that the channel can locate the correct file for the current time.",
+   "type": "object",
+@@ -124,6 +124,28 @@
+               "type": "null"
+             }
+           ]
++        },
++        "extra_audio": {
++          "description": "Audio tracks to output after the primary `audio` track, filling the channel's `normalization.audio.tracks` slots in order. Each is read from the same source as the primary audio track. Slots without an entry here are filled with silence, so every item has the same track layout.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/ExtraAudioTrack"
++          }
++        }
++      }
++    },
++    "ExtraAudioTrack": {
++      "type": "object",
++      "description": "Fills one extra audio slot.",
++      "properties": {
++        "stream_index": {
++          "description": "Audio stream within the primary audio track's source. Omit it, or name a stream the source doesn't have, to fill the slot with silence.",
++          "type": [
++            "integer",
++            "null"
++          ],
++          "format": "uint32",
++          "minimum": 0
+         }
+       }
+     },
+-- 
+2.54.0 (Apple Git-157)
+
