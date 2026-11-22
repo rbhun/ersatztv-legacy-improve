@@ -1,0 +1,858 @@
+From 8d0b4783d1d4721abb3959cb671069062941557d Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 17:44:28 +0100
+Subject: [PATCH] feat: mux multiple subtitle tracks into MPEG-TS
+
+---
+ CHANGELOG.md                                  |   4 +
+ .../ersatztv-channel/src/channel_session.rs   |  36 ++-
+ crates/ersatztv-channel/src/config.rs         |  24 +-
+ crates/ersatztv-channel/src/describe.rs       |   2 +-
+ .../src/generate.rs                           |   3 +
+ crates/ersatztv-playout/src/playout.rs        |  14 +-
+ crates/ffpipeline/src/input.rs                |   3 +
+ crates/ffpipeline/src/output_settings.rs      |  11 +
+ crates/ffpipeline/src/pipeline.rs             | 259 +++++++++++++++++-
+ crates/ffpipeline/tests/common/mod.rs         |   2 +
+ examples/channel.json                         |   2 +-
+ examples/channel_copy.json                    |   2 +-
+ examples/playout/playout.json                 |   2 +-
+ schema/channel_config.json                    |  40 ++-
+ schema/playout.json                           |  24 +-
+ 15 files changed, 412 insertions(+), 16 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 29363ac..f0120ab 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ - Add `normalization.audio.tracks` to `channel.json` to output multiple audio tracks (channel config schema `0.1.6`)
+   - Each entry sets a track's `language` and `title`; the first describes the primary track
+   - Fill the extra tracks per item with `tracks.extra_audio` in the playout (playout schema `0.0.9`); unfilled tracks are silent, so every item has the same layout
++- Add `mux` subtitle mode and `normalization.subtitle.tracks` to `channel.json` to mux multiple subtitle tracks into the MPEG-TS stream instead of burning subtitles in (channel config schema `0.1.7`)
++  - Each entry sets a track's `language` and `title`; the first describes the primary track
++  - Fill the extra tracks per item with `tracks.extra_subtitle` in the playout (playout schema `0.0.10`); unfilled tracks reuse the primary subtitle stream
++  - Subtitles are encoded as DVD subtitles, so text subtitle sources can't be muxed; DVD and DVB subtitles are copied
+ 
+ ### Fixed
+ - Fix decoding a second audio stream from a source whose primary audio track is downmixed 5.1 AC-3
+diff --git a/crates/ersatztv-channel/src/channel_session.rs b/crates/ersatztv-channel/src/channel_session.rs
+index fc4f49c..ea6bece 100644
+--- a/crates/ersatztv-channel/src/channel_session.rs
++++ b/crates/ersatztv-channel/src/channel_session.rs
+@@ -32,7 +32,7 @@ use ffpipeline::keyframe_seek::{
+ };
+ use ffpipeline::output_settings::{
+     AudioOutputSettings, AudioTrackMetadata, AudioTranscodeSettings, CopyPolicy, OutputSettings,
+-    SubtitleMode, VideoOutputSettings, VideoTranscodeSettings,
++    SubtitleMode, SubtitleTrackMetadata, VideoOutputSettings, VideoTranscodeSettings,
+ };
+ use ffpipeline::pipeline::{Hz, Kbps, PtsOffset, SEGMENT_SECONDS};
+ use ffpipeline::probe::{
+@@ -566,11 +566,32 @@ impl ChannelSession {
+         pts_duration: Option<Duration>,
+         is_fallback: bool,
+     ) -> Result<(OffsetDateTime, bool), ChannelError> {
++        let subtitle_tracks: Vec<SubtitleTrackMetadata> = self
++            .channel_config
++            .normalization
++            .subtitle
++            .tracks
++            .iter()
++            .map(|t| SubtitleTrackMetadata {
++                language: t.language.clone(),
++                title: t.title.clone(),
++            })
++            .collect();
+         let subtitle_mode = if is_fallback {
+             // the fallback message is only useful on screen
+             SubtitleMode::Burn
+         } else {
+-            self.channel_config.normalization.subtitle.mode.into()
++            let mode: SubtitleMode = self.channel_config.normalization.subtitle.mode.into();
++            if mode == SubtitleMode::Mux && subtitle_tracks.is_empty() {
++                SubtitleMode::Burn
++            } else {
++                mode
++            }
++        };
++        let subtitle_tracks = if subtitle_mode == SubtitleMode::Mux {
++            subtitle_tracks
++        } else {
++            Vec::new()
+         };
+ 
+         // prioritize source from audio tracks, then default source
+@@ -685,6 +706,7 @@ impl ChannelSession {
+             frame_rate: target_frame_rate(&self.channel_config.normalization)
+                 .or_else(|| video_probe_result.is_still_image().then(FrameRate::default)),
+             subtitle_mode,
++            subtitle_tracks,
+             fonts_folder: self
+                 .channel_config
+                 .normalization
+@@ -742,6 +764,12 @@ impl ChannelSession {
+             .map(|t| t.extra_audio.iter().map(|a| a.stream_index).collect())
+             .unwrap_or_default();
+ 
++        let extra_subtitle_indices = current_item
++            .tracks
++            .as_ref()
++            .map(|t| t.extra_subtitle.iter().map(|s| s.stream_index).collect())
++            .unwrap_or_default();
++
+         let subtitle_index = current_item
+             .tracks
+             .as_ref()
+@@ -798,6 +826,7 @@ impl ChannelSession {
+             video_copy_seek: None,
+             video_copy_blockers: Vec::new(),
+             extra_audio_indices,
++            extra_subtitle_indices,
+         };
+ 
+         let window = input_settings.duration();
+@@ -1904,6 +1933,7 @@ fn fallback_item(
+             }),
+             subtitle,
+             extra_audio: Vec::new(),
++            extra_subtitle: Vec::new(),
+         }),
+         watermark: None,
+         graphics: Vec::new(),
+@@ -2334,6 +2364,7 @@ mod tests {
+             video_copy_seek: None,
+             video_copy_blockers: Vec::new(),
+             extra_audio_indices: Vec::new(),
++            extra_subtitle_indices: Vec::new(),
+         };
+         let output = OutputSettings {
+             audio,
+@@ -2349,6 +2380,7 @@ mod tests {
+             is_live: false,
+             frame_rate: None,
+             subtitle_mode: SubtitleMode::Burn,
++            subtitle_tracks: Vec::new(),
+             fonts_folder: None,
+             subtitle_force_style: None,
+             reports_folder: None,
+diff --git a/crates/ersatztv-channel/src/config.rs b/crates/ersatztv-channel/src/config.rs
+index 747d20f..ed1bcf9 100644
+--- a/crates/ersatztv-channel/src/config.rs
++++ b/crates/ersatztv-channel/src/config.rs
+@@ -14,7 +14,7 @@ use crate::error::{ChannelError, IoContext};
+ 
+ pub const SUPPORTED_SCHEMA: SchemaVersion = SchemaVersion {
+     breaking: 1,
+-    compatible: 6,
++    compatible: 7,
+ };
+ pub const SCHEMA: VersionedSchema =
+     VersionedSchema::new("https://ersatztv.org/channel/version/", SUPPORTED_SCHEMA);
+@@ -840,9 +840,16 @@ impl From<VideoFormat> for ffpipeline::pipeline::EncodeFormat {
+ 
+ #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
+ pub struct SubtitleNormalizationConfig {
+-    /// What to do with the selected text subtitle track. Image subtitles are always burned in.
++    /// What to do with the selected subtitle track. Image subtitles are always burned in, except
++    /// with `mux`.
+     #[serde(default)]
+     pub mode: SubtitleMode,
++    /// Subtitle tracks to mux into the MPEG-TS stream with `mode` `mux`, in order. The first
++    /// entry describes the primary track, from the playout item's `tracks.subtitle`; each further
++    /// entry is filled from `tracks.extra_subtitle`, falling back to the primary stream. Empty
++    /// muxes nothing and burns subtitles as usual.
++    #[serde(default)]
++    pub tracks: Vec<SubtitleTrackConfig>,
+     /// Folder of fonts for burned-in text subtitles.
+     #[serde(default)]
+     pub fonts_folder: Option<String>,
+@@ -852,6 +859,15 @@ pub struct SubtitleNormalizationConfig {
+     pub force_style: Option<String>,
+ }
+ 
++#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
++#[schemars(title = "SubtitleTrack")]
++pub struct SubtitleTrackConfig {
++    /// Language tag for the track, e.g. `eng`.
++    pub language: Option<String>,
++    /// Track title shown in players, e.g. `English`.
++    pub title: Option<String>,
++}
++
+ #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default, Copy)]
+ #[serde(rename_all = "lowercase")]
+ #[schemars(title = "SubtitleMode")]
+@@ -861,6 +877,9 @@ pub enum SubtitleMode {
+     Burn,
+     /// Convert text subtitles to a WebVTT track in the HLS stream.
+     Convert,
++    /// Mux subtitle tracks into the MPEG-TS stream as DVD subtitles instead of burning them in.
++    /// Needs `normalization.subtitle.tracks`.
++    Mux,
+ }
+ 
+ impl From<SubtitleMode> for ffpipeline::output_settings::SubtitleMode {
+@@ -868,6 +887,7 @@ impl From<SubtitleMode> for ffpipeline::output_settings::SubtitleMode {
+         match value {
+             SubtitleMode::Burn => ffpipeline::output_settings::SubtitleMode::Burn,
+             SubtitleMode::Convert => ffpipeline::output_settings::SubtitleMode::Convert,
++            SubtitleMode::Mux => ffpipeline::output_settings::SubtitleMode::Mux,
+         }
+     }
+ }
+diff --git a/crates/ersatztv-channel/src/describe.rs b/crates/ersatztv-channel/src/describe.rs
+index d04f637..54b332e 100644
+--- a/crates/ersatztv-channel/src/describe.rs
++++ b/crates/ersatztv-channel/src/describe.rs
+@@ -214,6 +214,6 @@ mod tests {
+             "videotoolbox",
+             "vulkan",
+         ]);
+-        assert_round_trips::<SubtitleMode>(&["burn", "convert"]);
++        assert_round_trips::<SubtitleMode>(&["burn", "convert", "mux"]);
+     }
+ }
+diff --git a/crates/ersatztv-playout-generator/src/generate.rs b/crates/ersatztv-playout-generator/src/generate.rs
+index c01d9c6..56f495e 100644
+--- a/crates/ersatztv-playout-generator/src/generate.rs
++++ b/crates/ersatztv-playout-generator/src/generate.rs
+@@ -286,6 +286,7 @@ async fn build_items(
+                     }),
+                     subtitle: None,
+                     extra_audio: Vec::new(),
++                    extra_subtitle: Vec::new(),
+                 });
+ 
+                 playout_item.source = None;
+@@ -304,6 +305,7 @@ async fn build_items(
+                                 stream_index: Some(video_stream.stream_index),
+                             }),
+                             extra_audio: Vec::new(),
++                            extra_subtitle: Vec::new(),
+                         })
+                     }
+                 }
+@@ -339,6 +341,7 @@ async fn build_items(
+                                 stream_index: None,
+                             }),
+                             extra_audio: Vec::new(),
++                            extra_subtitle: Vec::new(),
+                         });
+                         break;
+                     }
+diff --git a/crates/ersatztv-playout/src/playout.rs b/crates/ersatztv-playout/src/playout.rs
+index f039f7b..ad3cd08 100644
+--- a/crates/ersatztv-playout/src/playout.rs
++++ b/crates/ersatztv-playout/src/playout.rs
+@@ -14,7 +14,7 @@ pub const DATE_FORMAT: Iso8601<DATE_CONFIG> = Iso8601::<DATE_CONFIG>;
+ 
+ pub const SUPPORTED_SCHEMA: SchemaVersion = SchemaVersion {
+     breaking: 0,
+-    compatible: 9,
++    compatible: 10,
+ };
+ pub const SCHEMA: VersionedSchema =
+     VersionedSchema::new("https://ersatztv.org/playout/version/", SUPPORTED_SCHEMA);
+@@ -105,6 +105,14 @@ pub struct PlayoutItemTracks {
+     pub subtitle: Option<TrackSelection>,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub extra_audio: Vec<ExtraAudioTrack>,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub extra_subtitle: Vec<ExtraSubtitleTrack>,
++}
++
++#[derive(Debug, Deserialize, Serialize)]
++pub struct ExtraSubtitleTrack {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub stream_index: Option<u32>,
+ }
+ 
+ #[derive(Debug, Deserialize, Serialize)]
+@@ -865,7 +873,7 @@ mod tests {
+     async fn newer_schema_is_rejected_with_supported_version() {
+         let dir = tempfile::tempdir().unwrap();
+         let path = dir.path().join("playout.json");
+-        let newer = "https://ersatztv.org/playout/version/0.0.10";
++        let newer = "https://ersatztv.org/playout/version/0.0.11";
+         let value = serde_json::json!({ "version": newer, "items": [] });
+         tokio::fs::write(&path, serde_json::to_vec(&value).unwrap())
+             .await
+@@ -877,7 +885,7 @@ mod tests {
+                 supported,
+             })) => {
+                 assert_eq!(found, newer);
+-                assert_eq!(supported, "https://ersatztv.org/playout/version/0.0.9");
++                assert_eq!(supported, "https://ersatztv.org/playout/version/0.0.10");
+             }
+             other => panic!("expected Unsupported, got {:?}", other.err()),
+         }
+diff --git a/crates/ffpipeline/src/input.rs b/crates/ffpipeline/src/input.rs
+index f72a197..df00189 100644
+--- a/crates/ffpipeline/src/input.rs
++++ b/crates/ffpipeline/src/input.rs
+@@ -31,6 +31,9 @@ pub struct InputSettings {
+     /// Source stream for each audio track after the primary, read from `audio_input`.
+     /// `None`, or an index the source doesn't have, fills that track with silence.
+     pub extra_audio_indices: Vec<Option<u32>>,
++    /// Source stream for each subtitle track after the primary, read from `subtitle_input`.
++    /// `None`, or an index the source doesn't have, reuses the primary subtitle stream.
++    pub extra_subtitle_indices: Vec<Option<u32>>,
+ }
+ 
+ impl InputSettings {
+diff --git a/crates/ffpipeline/src/output_settings.rs b/crates/ffpipeline/src/output_settings.rs
+index eff617b..468d6e5 100644
+--- a/crates/ffpipeline/src/output_settings.rs
++++ b/crates/ffpipeline/src/output_settings.rs
+@@ -18,6 +18,8 @@ pub struct OutputSettings {
+     pub is_live: bool,
+     pub frame_rate: Option<FrameRate>,
+     pub subtitle_mode: SubtitleMode,
++    /// Output subtitle tracks for `SubtitleMode::Mux`, in order. Empty muxes none.
++    pub subtitle_tracks: Vec<SubtitleTrackMetadata>,
+     pub fonts_folder: Option<String>,
+     pub subtitle_force_style: Option<String>,
+     pub reports_folder: Option<String>,
+@@ -198,10 +200,19 @@ impl Default for AudioLoudnessSettings {
+     }
+ }
+ 
++#[derive(Debug, Clone, Default)]
++pub struct SubtitleTrackMetadata {
++    /// ISO 639-2 language code written to the stream, e.g. `eng`.
++    pub language: Option<String>,
++    pub title: Option<String>,
++}
++
+ #[derive(Debug, PartialEq)]
+ pub enum SubtitleMode {
+     Burn,
+     Convert,
++    /// Mux subtitle tracks into the output without burning anything into the video.
++    Mux,
+ }
+ 
+ #[derive(Debug, PartialEq, Clone, Copy)]
+diff --git a/crates/ffpipeline/src/pipeline.rs b/crates/ffpipeline/src/pipeline.rs
+index 410e2d1..17eb244 100644
+--- a/crates/ffpipeline/src/pipeline.rs
++++ b/crates/ffpipeline/src/pipeline.rs
+@@ -27,7 +27,8 @@ use crate::input::{
+ use crate::output_format::gop_frames;
+ use crate::output_option::OutputOption;
+ use crate::output_settings::{
+-    AudioTrackMetadata, OutputSettings, ScalingMode, SubtitleMode, VideoFilterOptions, YadifOptions,
++    AudioTrackMetadata, OutputSettings, ScalingMode, SubtitleMode, SubtitleTrackMetadata,
++    VideoFilterOptions, YadifOptions,
+ };
+ use crate::overlay_filter::{
+     FramePoint, OverlayFilter, OverlayKind, OverlaySource, SoftwareOverlay,
+@@ -627,6 +628,24 @@ pub(crate) enum ExtraAudioSource {
+     Silence,
+ }
+ 
++/// Subtitle streams muxed into the output when `SubtitleMode::Mux` is set.
++#[derive(Debug, Clone)]
++struct MuxSubtitles {
++    input_source: InputSource,
++    path: String,
++    seek: Duration,
++    streams: Vec<MuxSubtitleStream>,
++}
++
++#[derive(Debug, Clone)]
++struct MuxSubtitleStream {
++    index: u32,
++    /// The source is already a codec MPEG-TS carries, so it can be copied.
++    copy: bool,
++}
++
++const MPEGTS_SUBTITLE_CODECS: &[&str] = &["dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub"];
++
+ const EXTRA_AUDIO_SILENCE: &str = "anullsrc=channel_layout=stereo:sample_rate=48000";
+ 
+ pub struct Pipeline {
+@@ -644,6 +663,8 @@ pub struct Pipeline {
+ 
+     extra_audio: Vec<ExtraAudioSource>,
+     audio_tracks: Vec<AudioTrackMetadata>,
++    mux_subtitles: Option<MuxSubtitles>,
++    subtitle_tracks: Vec<SubtitleTrackMetadata>,
+     /// Encodes silent extra tracks when the primary audio is copied.
+     silence_codec: AudioCodec,
+ 
+@@ -683,6 +704,8 @@ impl Pipeline {
+             })
+             .collect();
+ 
++        let mux_subtitles = mux_subtitles(&input_settings, &final_output_settings);
++
+         if let Some(accel) = &final_output_settings.accel
+             && accel
+                 .known_accel()
+@@ -1412,6 +1435,12 @@ impl Pipeline {
+                 AudioFormat::Ac3 => AudioCodec::Ac3,
+             },
+             audio_tracks: final_output_settings.audio.tracks.clone(),
++            subtitle_tracks: if mux_subtitles.is_some() {
++                final_output_settings.subtitle_tracks.clone()
++            } else {
++                Vec::new()
++            },
++            mux_subtitles,
+         })
+     }
+ 
+@@ -1932,6 +1961,30 @@ impl Pipeline {
+             }
+         }
+ 
++        let mut subtitle_maps: Vec<String> = Vec::new();
++        if let Some(mux) = &self.mux_subtitles {
++            let input_index = match input_paths.iter().position(|p| *p == mux.path.as_str()) {
++                Some(shared_index) => shared_index,
++                None => {
++                    input_paths.push(mux.path.as_str());
++
++                    if !mux.seek.is_zero() {
++                        result.extend(args!["-ss", format!("{}ms", mux.seek.as_millis())]);
++                    }
++
++                    result.extend(mux.input_source.args_for_input());
++                    result.extend(args!["-i", mux.path.to_owned()]);
++
++                    input_paths.len() - 1
++                }
++            };
++            subtitle_maps = mux
++                .streams
++                .iter()
++                .map(|s| format!("{input_index}:{}", s.index))
++                .collect();
++        }
++
+         let mut filter_chain = self.filter_chain.to_owned();
+         filter_chain.build(
+             &audio_label,
+@@ -1963,8 +2016,12 @@ impl Pipeline {
+         for map in extra_audio_maps {
+             result.extend(args!["-map", map]);
+         }
++        for map in subtitle_maps {
++            result.extend(args!["-map", map]);
++        }
+ 
+         let mut audio_track_args = self.audio_track_args();
++        audio_track_args.extend(self.subtitle_track_args());
+         for option in &self.output_options {
+             // per-track options must come before the output path that `-f` ends with
+             if matches!(option, OutputOption::Format(_)) {
+@@ -1977,6 +2034,34 @@ impl Pipeline {
+         result
+     }
+ 
++    fn subtitle_track_args(&self) -> ArgVec {
++        let mut result: ArgVec = Vec::new();
++
++        if let Some(mux) = &self.mux_subtitles {
++            for (n, stream) in mux.streams.iter().enumerate() {
++                let codec = if stream.copy { "copy" } else { "dvdsub" };
++                result.extend(args![format!("-c:s:{n}"), codec]);
++            }
++        }
++
++        for (n, track) in self.subtitle_tracks.iter().enumerate() {
++            if let Some(language) = &track.language {
++                result.extend(args![
++                    format!("-metadata:s:s:{n}"),
++                    format!("language={language}")
++                ]);
++            }
++            if let Some(title) = &track.title {
++                result.extend(args![
++                    format!("-metadata:s:s:{n}"),
++                    format!("title={title}")
++                ]);
++            }
++        }
++
++        result
++    }
++
+     fn audio_track_args(&self) -> ArgVec {
+         let mut result: ArgVec = Vec::new();
+ 
+@@ -2036,11 +2121,64 @@ fn unknown_pgs_canvas_size(stream: &ProbeResultVideoStream) -> Option<FrameSize>
+     )
+ }
+ 
++/// One stream per output subtitle track. The primary track is the item's selected subtitle;
++/// each further track reads its `extra_subtitle_indices` entry, or reuses the primary.
++fn mux_subtitles(
++    input_settings: &InputSettings,
++    output_settings: &OutputSettings,
++) -> Option<MuxSubtitles> {
++    if output_settings.subtitle_mode != SubtitleMode::Mux
++        || output_settings.subtitle_tracks.is_empty()
++    {
++        return None;
++    }
++
++    let input = input_settings.subtitle_input.as_ref()?;
++    let primary = input_settings.select_subtitle_stream()?;
++    let subtitle_stream = |index: u32| {
++        input.probe_result.streams.iter().find_map(|s| match s {
++            ProbeResultStream::Video(v)
++                if v.codec_type == CodecType::Subtitle && v.stream_index == index =>
++            {
++                Some(&**v)
++            }
++            _ => None,
++        })
++    };
++
++    let streams = (0..output_settings.subtitle_tracks.len())
++        .map(|track| {
++            let stream = track
++                .checked_sub(1)
++                .and_then(|extra| input_settings.extra_subtitle_indices.get(extra))
++                .copied()
++                .flatten()
++                .and_then(subtitle_stream)
++                .unwrap_or(primary);
++            MuxSubtitleStream {
++                index: stream.stream_index,
++                copy: MPEGTS_SUBTITLE_CODECS.contains(&stream.codec.as_str()),
++            }
++        })
++        .collect();
++
++    Some(MuxSubtitles {
++        input_source: input.input_source.clone(),
++        path: input.probe_result.path.clone(),
++        seek: input.in_point,
++        streams,
++    })
++}
++
+ fn subtitle_burn<'a>(
+     input_settings: &'a InputSettings,
+     output_settings: &OutputSettings,
+     video_stream: &ProbeResultVideoStream,
+ ) -> Option<SubtitleBurn<'a>> {
++    if output_settings.subtitle_mode == SubtitleMode::Mux {
++        return None;
++    }
++
+     match (
+         input_settings.select_subtitle_stream(),
+         input_settings.subtitle_input.as_ref(),
+@@ -2240,6 +2378,7 @@ mod tests {
+             video_copy_seek: None,
+             video_copy_blockers: Vec::new(),
+             extra_audio_indices: Vec::new(),
++            extra_subtitle_indices: Vec::new(),
+         }
+     }
+ 
+@@ -2284,6 +2423,7 @@ mod tests {
+             is_live: false,
+             frame_rate: None,
+             subtitle_mode: SubtitleMode::Burn,
++            subtitle_tracks: Vec::new(),
+             fonts_folder: None,
+             subtitle_force_style: None,
+             reports_folder: None,
+@@ -3786,4 +3926,121 @@ mod tests {
+         assert!(!args.contains(&EXTRA_AUDIO_SILENCE.to_owned()));
+         assert!(!args.contains(&"0:2".to_owned()));
+     }
++
++    fn mux_subtitle_input(extra_subtitle_indices: Vec<Option<u32>>) -> InputSettings {
++        let mut input = multichannel_ac3_input("main.mkv");
++        let mut subtitle = image_subtitle_input("subs.mkv", "hdmv_pgs_subtitle", None);
++        subtitle.stream_index = Some(7);
++        let mut dvb = subtitle.probe_result.streams[0].clone();
++        if let crate::probe::ProbeResultStream::Video(video) = &mut dvb {
++            video.stream_index = 8;
++            video.codec = "dvb_subtitle".to_owned();
++        }
++        subtitle.probe_result.streams.push(dvb);
++        input.subtitle_input = Some(subtitle);
++        input.extra_subtitle_indices = extra_subtitle_indices;
++        input
++    }
++
++    fn mux_output(languages: &[&str]) -> OutputSettings {
++        let mut output = stereo_output();
++        output.subtitle_mode = SubtitleMode::Mux;
++        output.subtitle_tracks = languages
++            .iter()
++            .map(|language| SubtitleTrackMetadata {
++                language: Some((*language).to_owned()),
++                title: Some(language.to_uppercase()),
++            })
++            .collect();
++        output
++    }
++
++    fn mux_args(input: InputSettings, output: OutputSettings) -> Vec<String> {
++        let mut pipeline = Pipeline::full(&FfmpegInfo::default(), input, output).unwrap();
++        pipeline.optimize();
++        pipeline.args().iter().map(|a| a.to_string()).collect()
++    }
++
++    #[test]
++    fn mux_maps_subtitle_streams_without_burning() {
++        let args = mux_args(
++            mux_subtitle_input(vec![Some(8), Some(99)]),
++            mux_output(&["eng", "spa", "fre"]),
++        );
++        let pairs = arg_pairs(&args);
++
++        // the subtitle file is its own input, after the video input
++        assert!(pairs.contains(&("-i".to_owned(), "subs.mkv".to_owned())));
++        for map in ["1:7", "1:8"] {
++            assert!(
++                pairs.contains(&("-map".to_owned(), map.to_owned())),
++                "{args:?}"
++            );
++        }
++        // an index the source doesn't have reuses the primary stream
++        assert_eq!(
++            pairs
++                .iter()
++                .filter(|(a, b)| a == "-map" && b == "1:7")
++                .count(),
++            2,
++            "{args:?}"
++        );
++        // PGS is encoded; DVB is copied
++        assert!(pairs.contains(&("-c:s:0".to_owned(), "dvdsub".to_owned())));
++        assert!(pairs.contains(&("-c:s:1".to_owned(), "copy".to_owned())));
++        assert!(pairs.contains(&("-c:s:2".to_owned(), "dvdsub".to_owned())));
++        for (n, language) in ["eng", "spa", "fre"].iter().enumerate() {
++            assert!(
++                pairs.contains(&(format!("-metadata:s:s:{n}"), format!("language={language}")))
++            );
++            assert!(pairs.contains(&(
++                format!("-metadata:s:s:{n}"),
++                format!("title={}", language.to_uppercase())
++            )));
++        }
++        // nothing is burned into the video
++        assert!(
++            !args
++                .iter()
++                .any(|a| a.contains("overlay") || a.contains("subtitles=")),
++            "{args:?}"
++        );
++        let format = args.iter().rposition(|a| a == "-f").unwrap();
++        let last_metadata = args
++            .iter()
++            .rposition(|a| a.starts_with("-metadata:s:s:"))
++            .unwrap();
++        assert!(last_metadata < format, "{args:?}");
++    }
++
++    #[test]
++    fn mux_maps_subtitles_after_audio() {
++        let mut input = mux_subtitle_input(Vec::new());
++        input.extra_audio_indices = vec![None];
++        let mut output = mux_output(&["eng"]);
++        output.audio.tracks = vec![AudioTrackMetadata::default(); 2];
++        let args = mux_args(input, output);
++
++        let maps: Vec<&String> = args
++            .windows(2)
++            .filter(|w| w[0] == "-map")
++            .map(|w| &w[1])
++            .collect();
++        assert_eq!(maps.last().map(|m| m.as_str()), Some("2:7"), "{args:?}");
++        assert_eq!(maps.len(), 4, "{args:?}");
++    }
++
++    #[test]
++    fn burn_mode_does_not_mux_subtitles() {
++        let mut output = mux_output(&["eng"]);
++        output.subtitle_mode = SubtitleMode::Burn;
++        let args = mux_args(mux_subtitle_input(Vec::new()), output);
++
++        assert!(!args.iter().any(|a| a.starts_with("-c:s:")), "{args:?}");
++        assert!(
++            !args.iter().any(|a| a.starts_with("-metadata:s:s:")),
++            "{args:?}"
++        );
++    }
+ }
+diff --git a/crates/ffpipeline/tests/common/mod.rs b/crates/ffpipeline/tests/common/mod.rs
+index dcfd606..7b959f0 100644
+--- a/crates/ffpipeline/tests/common/mod.rs
++++ b/crates/ffpipeline/tests/common/mod.rs
+@@ -1336,6 +1336,7 @@ pub fn build_input(
+         video_copy_seek: None,
+         video_copy_blockers: Vec::new(),
+         extra_audio_indices: Vec::new(),
++        extra_subtitle_indices: Vec::new(),
+     }
+ }
+ 
+@@ -1481,6 +1482,7 @@ pub fn build_output(dir: &Path, params: TestOutputParams) -> OutputSettings {
+         is_live: false,
+         frame_rate: params.frame_rate,
+         subtitle_mode: SubtitleMode::Burn,
++        subtitle_tracks: Vec::new(),
+         fonts_folder: params.fonts_folder,
+         subtitle_force_style: params.subtitle_force_style,
+         reports_folder: None,
+diff --git a/examples/channel.json b/examples/channel.json
+index 281fbe6..f0a06dc 100644
+--- a/examples/channel.json
++++ b/examples/channel.json
+@@ -1,5 +1,5 @@
+ {
+-  "version": "https://ersatztv.org/channel/version/0.1.6",
++  "version": "https://ersatztv.org/channel/version/0.1.7",
+   "playout": {
+     "folder": "./playout"
+   },
+diff --git a/examples/channel_copy.json b/examples/channel_copy.json
+index 843ffea..ac057ce 100644
+--- a/examples/channel_copy.json
++++ b/examples/channel_copy.json
+@@ -1,5 +1,5 @@
+ {
+-  "version": "https://ersatztv.org/channel/version/0.1.6",
++  "version": "https://ersatztv.org/channel/version/0.1.7",
+   "playout": {
+     "folder": "./playout"
+   },
+diff --git a/examples/playout/playout.json b/examples/playout/playout.json
+index 6a3c1c9..ec17455 100644
+--- a/examples/playout/playout.json
++++ b/examples/playout/playout.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "../../schema/playout.json",
+-  "version": "https://ersatztv.org/playout/version/0.0.9",
++  "version": "https://ersatztv.org/playout/version/0.0.10",
+   "items": [
+     {
+       "id": "1",
+diff --git a/schema/channel_config.json b/schema/channel_config.json
+index 537ff8e..92cbe47 100644
+--- a/schema/channel_config.json
++++ b/schema/channel_config.json
+@@ -1,5 +1,5 @@
+ {
+-  "$id": "https://ersatztv.org/channel/version/0.1.6",
++  "$id": "https://ersatztv.org/channel/version/0.1.7",
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "title": "ChannelConfig",
+   "description": "Settings for one channel: where its playout is, which ffmpeg to use, and the output format.\nA relative path in any of these settings is relative to the file that sets it.",
+@@ -445,7 +445,8 @@
+           "default": {
+             "fonts_folder": null,
+             "force_style": null,
+-            "mode": "burn"
++            "mode": "burn",
++            "tracks": []
+           }
+         },
+         "video": {
+@@ -563,6 +564,11 @@
+           "description": "Convert text subtitles to a WebVTT track in the HLS stream.",
+           "type": "string",
+           "const": "convert"
++        },
++        {
++          "description": "Mux subtitle tracks into the MPEG-TS stream as DVD subtitles instead of burning them in.\nNeeds `normalization.subtitle.tracks`.",
++          "type": "string",
++          "const": "mux"
+         }
+       ]
+     },
+@@ -586,9 +592,37 @@
+           "default": null
+         },
+         "mode": {
+-          "description": "What to do with the selected text subtitle track. Image subtitles are always burned in.",
++          "description": "What to do with the selected subtitle track. Image subtitles are always burned in, except\nwith `mux`.",
+           "$ref": "#/$defs/SubtitleMode",
+           "default": "burn"
++        },
++        "tracks": {
++          "description": "Subtitle tracks to mux into the MPEG-TS stream with `mode` `mux`, in order. The first\nentry describes the primary track, from the playout item's `tracks.subtitle`; each further\nentry is filled from `tracks.extra_subtitle`, falling back to the primary stream. Empty\nmuxes nothing and burns subtitles as usual.",
++          "type": "array",
++          "default": [],
++          "items": {
++            "$ref": "#/$defs/SubtitleTrackConfig"
++          }
++        }
++      }
++    },
++    "SubtitleTrackConfig": {
++      "title": "SubtitleTrack",
++      "type": "object",
++      "properties": {
++        "language": {
++          "description": "Language tag for the track, e.g. `eng`.",
++          "type": [
++            "string",
++            "null"
++          ]
++        },
++        "title": {
++          "description": "Track title shown in players, e.g. `English`.",
++          "type": [
++            "string",
++            "null"
++          ]
+         }
+       }
+     },
+diff --git a/schema/playout.json b/schema/playout.json
+index 6c7baec..9066ca1 100644
+--- a/schema/playout.json
++++ b/schema/playout.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+-  "$id": "https://ersatztv.org/playout/version/0.0.9",
++  "$id": "https://ersatztv.org/playout/version/0.0.10",
+   "title": "Playout",
+   "description": "A playout schedule for a single time window.\n\nFiles should be named `{start}_{finish}.json` using compact ISO 8601 (no separators), e.g. `20260413T000000.000000000-0500_20260414T002131.620000000-0500.json`, so that the channel can locate the correct file for the current time.",
+   "type": "object",
+@@ -131,6 +131,28 @@
+           "items": {
+             "$ref": "#/definitions/ExtraAudioTrack"
+           }
++        },
++        "extra_subtitle": {
++          "description": "Subtitle tracks to output after the primary `subtitle` track, filling the channel's `normalization.subtitle.tracks` slots in order when `normalization.subtitle.mode` is `mux`. Each is read from the same source as the primary subtitle track. Slots without an entry here, or whose stream the source doesn't have, reuse the primary subtitle stream.",
++          "type": "array",
++          "items": {
++            "$ref": "#/definitions/ExtraSubtitleTrack"
++          }
++        }
++      }
++    },
++    "ExtraSubtitleTrack": {
++      "type": "object",
++      "description": "Fills one extra subtitle slot.",
++      "properties": {
++        "stream_index": {
++          "description": "Subtitle stream within the primary subtitle track's source. Omit it, or name a stream the source doesn't have, to reuse the primary subtitle stream.",
++          "type": [
++            "integer",
++            "null"
++          ],
++          "format": "uint32",
++          "minimum": 0
+         }
+       }
+     },
+-- 
+2.54.0 (Apple Git-157)
+
