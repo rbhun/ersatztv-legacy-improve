@@ -1,0 +1,632 @@
+From d572eb371d75378e39a162118fb8d724d909d1ed Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 17:50:41 +0100
+Subject: [PATCH] feat: mux multiple subtitle tracks with the next engine
+
+Mirror multi-audio: channel Subtitle Track Languages switches Next to
+mux mode with ordered language/title slots; playout fills extra_subtitle
+from matching image streams (PGS/DVD/DVB). Text-to-dvdsub is unsupported.
+
+Co-authored-by: rbhun <rbhun@users.noreply.github.com>
+---
+ .../Channels/ChannelViewModel.cs              |  1 +
+ .../Channels/Commands/CreateChannel.cs        |  1 +
+ .../Channels/Commands/CreateChannelHandler.cs |  1 +
+ .../Channels/Commands/UpdateChannel.cs        |  1 +
+ .../Channels/Commands/UpdateChannelHandler.cs |  3 +
+ ErsatzTV.Application/Channels/Mapper.cs       |  1 +
+ .../Streaming/ChannelConfigConverter.cs       | 21 ++--
+ ErsatzTV.Core/Domain/Channel.cs               |  1 +
+ .../Domain/ChannelSubtitleLanguages.cs        | 20 ++++
+ ErsatzTV.Core/Next/Config/ChannelConfig.cs    | 33 ++++++-
+ ErsatzTV.Core/Next/Playout.cs                 | 22 +++++
+ ..._Add_ChannelNextEngineSubtitleLanguages.cs | 29 ++++++
+ .../Migrations/TvContextModelSnapshot.cs      |  3 +
+ ..._Add_ChannelNextEngineSubtitleLanguages.cs | 28 ++++++
+ .../Migrations/TvContextModelSnapshot.cs      |  3 +
+ .../Scheduling/PlayoutItemConverter.cs        | 99 ++++++++++++++++++-
+ .../Streaming/ChannelConfigConverterTests.cs  |  1 +
+ ErsatzTV/Pages/ChannelEditor.razor            | 10 ++
+ .../ChannelEditViewModelValidator.cs          |  5 +
+ ErsatzTV/ViewModels/ChannelEditViewModel.cs   |  3 +
+ 20 files changed, 275 insertions(+), 11 deletions(-)
+ create mode 100644 ErsatzTV.Core/Domain/ChannelSubtitleLanguages.cs
+ create mode 100644 ErsatzTV.Infrastructure.MySql/Migrations/20261122170010_Add_ChannelNextEngineSubtitleLanguages.cs
+ create mode 100644 ErsatzTV.Infrastructure.Sqlite/Migrations/20261122170000_Add_ChannelNextEngineSubtitleLanguages.cs
+
+diff --git a/ErsatzTV.Application/Channels/ChannelViewModel.cs b/ErsatzTV.Application/Channels/ChannelViewModel.cs
+index 54ae2bfe..aadf7618 100644
+--- a/ErsatzTV.Application/Channels/ChannelViewModel.cs
++++ b/ErsatzTV.Application/Channels/ChannelViewModel.cs
+@@ -24,6 +24,7 @@ public record ChannelViewModel(
+     StreamingEngine StreamingEngine,
+     NextEngineTextSubtitleMode NextEngineTextSubtitleMode,
+     string NextEngineAudioLanguages,
++    string NextEngineSubtitleLanguages,
+     StreamingMode StreamingMode,
+     int? WatermarkId,
+     int? FallbackFillerId,
+diff --git a/ErsatzTV.Application/Channels/Commands/CreateChannel.cs b/ErsatzTV.Application/Channels/Commands/CreateChannel.cs
+index ad0e9aa4..45cb926d 100644
+--- a/ErsatzTV.Application/Channels/Commands/CreateChannel.cs
++++ b/ErsatzTV.Application/Channels/Commands/CreateChannel.cs
+@@ -23,6 +23,7 @@ public record CreateChannel(
+     StreamingEngine StreamingEngine,
+     NextEngineTextSubtitleMode NextEngineTextSubtitleMode,
+     string NextEngineAudioLanguages,
++    string NextEngineSubtitleLanguages,
+     StreamingMode StreamingMode,
+     int? WatermarkId,
+     int? FallbackFillerId,
+diff --git a/ErsatzTV.Application/Channels/Commands/CreateChannelHandler.cs b/ErsatzTV.Application/Channels/Commands/CreateChannelHandler.cs
+index 21a178b4..3358e366 100644
+--- a/ErsatzTV.Application/Channels/Commands/CreateChannelHandler.cs
++++ b/ErsatzTV.Application/Channels/Commands/CreateChannelHandler.cs
+@@ -88,6 +88,7 @@ await MirrorSourceMustBeValid(dbContext, request, cancellationToken))
+                 StreamingEngine = StreamingEngine.Next,
+                 NextEngineTextSubtitleMode = request.NextEngineTextSubtitleMode,
+                 NextEngineAudioLanguages = ChannelAudioLanguages.Normalize(request.NextEngineAudioLanguages),
++                NextEngineSubtitleLanguages = ChannelSubtitleLanguages.Normalize(request.NextEngineSubtitleLanguages),
+                 StreamingMode = request.StreamingMode,
+                 Artwork = artwork,
+                 StreamSelectorMode = request.StreamSelectorMode,
+diff --git a/ErsatzTV.Application/Channels/Commands/UpdateChannel.cs b/ErsatzTV.Application/Channels/Commands/UpdateChannel.cs
+index d2c928ec..c268aad7 100644
+--- a/ErsatzTV.Application/Channels/Commands/UpdateChannel.cs
++++ b/ErsatzTV.Application/Channels/Commands/UpdateChannel.cs
+@@ -24,6 +24,7 @@ public record UpdateChannel(
+     StreamingEngine StreamingEngine,
+     NextEngineTextSubtitleMode NextEngineTextSubtitleMode,
+     string NextEngineAudioLanguages,
++    string NextEngineSubtitleLanguages,
+     StreamingMode StreamingMode,
+     int? WatermarkId,
+     int? FallbackFillerId,
+diff --git a/ErsatzTV.Application/Channels/Commands/UpdateChannelHandler.cs b/ErsatzTV.Application/Channels/Commands/UpdateChannelHandler.cs
+index f881a681..0cc75228 100644
+--- a/ErsatzTV.Application/Channels/Commands/UpdateChannelHandler.cs
++++ b/ErsatzTV.Application/Channels/Commands/UpdateChannelHandler.cs
+@@ -53,6 +53,8 @@ private async Task<ChannelViewModel> ApplyUpdateRequest(
+                                 c.PreferredSubtitleLanguageCode != update.PreferredSubtitleLanguageCode ||
+                                 c.NextEngineAudioLanguages !=
+                                 ChannelAudioLanguages.Normalize(update.NextEngineAudioLanguages) ||
++                                c.NextEngineSubtitleLanguages !=
++                                ChannelSubtitleLanguages.Normalize(update.NextEngineSubtitleLanguages) ||
+                                 c.MusicVideoCreditsMode != update.MusicVideoCreditsMode ||
+                                 c.SubtitleMode != update.SubtitleMode;
+ 
+@@ -146,6 +148,7 @@ await dbContext.Entry(c)
+         c.StreamingEngine = StreamingEngine.Next;
+         c.NextEngineTextSubtitleMode = update.NextEngineTextSubtitleMode;
+         c.NextEngineAudioLanguages = ChannelAudioLanguages.Normalize(update.NextEngineAudioLanguages);
++        c.NextEngineSubtitleLanguages = ChannelSubtitleLanguages.Normalize(update.NextEngineSubtitleLanguages);
+         c.StreamingMode = update.StreamingMode;
+         c.WatermarkId = update.WatermarkId;
+         c.FallbackFillerId = update.FallbackFillerId;
+diff --git a/ErsatzTV.Application/Channels/Mapper.cs b/ErsatzTV.Application/Channels/Mapper.cs
+index b6cbbefc..91a22b55 100644
+--- a/ErsatzTV.Application/Channels/Mapper.cs
++++ b/ErsatzTV.Application/Channels/Mapper.cs
+@@ -27,6 +27,7 @@ internal static ChannelViewModel ProjectToViewModel(Channel channel, int playout
+             channel.StreamingEngine,
+             channel.NextEngineTextSubtitleMode,
+             channel.NextEngineAudioLanguages,
++            channel.NextEngineSubtitleLanguages,
+             channel.StreamingMode,
+             channel.WatermarkId,
+             channel.FallbackFillerId,
+diff --git a/ErsatzTV.Application/Streaming/ChannelConfigConverter.cs b/ErsatzTV.Application/Streaming/ChannelConfigConverter.cs
+index 5e8b8502..c4e28e6c 100644
+--- a/ErsatzTV.Application/Streaming/ChannelConfigConverter.cs
++++ b/ErsatzTV.Application/Streaming/ChannelConfigConverter.cs
+@@ -16,7 +16,7 @@ namespace ErsatzTV.Application.Streaming;
+ public class ChannelConfigConverter(IConfigElementRepository configElementRepository, IFileSystem fileSystem)
+     : IChannelConfigConverter
+ {
+-    public static readonly string ChannelConfigVersion = "https://ersatztv.org/channel/version/0.1.6";
++    public static readonly string ChannelConfigVersion = "https://ersatztv.org/channel/version/0.1.7";
+ 
+     public async Task<ChannelConfig> ToNext(
+         ChannelViewModel channel,
+@@ -139,15 +139,24 @@ public async Task<ChannelConfig> ToNext(
+             videoNormalization.FrameRate = frameRate;
+         }
+ 
++        List<string> subtitleLanguages = ChannelSubtitleLanguages.Parse(channel.NextEngineSubtitleLanguages);
+         var subtitleNormalization = new Subtitle
+         {
+-            Mode = channel.NextEngineTextSubtitleMode switch
+-            {
+-                NextEngineTextSubtitleMode.Convert => SubtitleMode.Convert,
+-                _ => SubtitleMode.Burn
+-            },
++            Mode = subtitleLanguages.Count > 0
++                ? SubtitleMode.Mux
++                : channel.NextEngineTextSubtitleMode switch
++                {
++                    NextEngineTextSubtitleMode.Convert => SubtitleMode.Convert,
++                    _ => SubtitleMode.Burn
++                },
+             FontsFolder = FileSystemLayout.FontsCacheFolder
+         };
++        if (subtitleLanguages.Count > 0)
++        {
++            subtitleNormalization.Tracks = subtitleLanguages
++                .Select(language => new SubtitleTrack { Language = language, Title = LanguageTitle(language) })
++                .ToList();
++        }
+ 
+         string playoutFolder = fileSystem.Path.Combine(FileSystemLayout.NextPlayoutsFolder, channel.Number, "current");
+ 
+diff --git a/ErsatzTV.Core/Domain/Channel.cs b/ErsatzTV.Core/Domain/Channel.cs
+index 15224868..b100c562 100644
+--- a/ErsatzTV.Core/Domain/Channel.cs
++++ b/ErsatzTV.Core/Domain/Channel.cs
+@@ -25,6 +25,7 @@ public class Channel
+     public StreamingEngine StreamingEngine { get; set; }
+     public NextEngineTextSubtitleMode NextEngineTextSubtitleMode { get; set; }
+     public string NextEngineAudioLanguages { get; set; }
++    public string NextEngineSubtitleLanguages { get; set; }
+     public StreamingMode StreamingMode { get; set; }
+     public List<Playout> Playouts { get; set; }
+     public List<Artwork> Artwork { get; set; }
+diff --git a/ErsatzTV.Core/Domain/ChannelSubtitleLanguages.cs b/ErsatzTV.Core/Domain/ChannelSubtitleLanguages.cs
+new file mode 100644
+index 00000000..fbc39457
+--- /dev/null
++++ b/ErsatzTV.Core/Domain/ChannelSubtitleLanguages.cs
+@@ -0,0 +1,20 @@
++namespace ErsatzTV.Core.Domain;
++
++public static class ChannelSubtitleLanguages
++{
++    private static readonly char[] Separators = [',', ' ', ';'];
++
++    // ordered; the first language is the primary subtitle track
++    public static List<string> Parse(string languages) =>
++        (languages ?? string.Empty)
++        .Split(Separators, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
++        .Select(l => l.ToLowerInvariant())
++        .Distinct()
++        .ToList();
++
++    public static string Normalize(string languages)
++    {
++        List<string> parsed = Parse(languages);
++        return parsed.Count == 0 ? null : string.Join(",", parsed);
++    }
++}
+diff --git a/ErsatzTV.Core/Next/Config/ChannelConfig.cs b/ErsatzTV.Core/Next/Config/ChannelConfig.cs
+index bc7b438e..96693388 100644
+--- a/ErsatzTV.Core/Next/Config/ChannelConfig.cs
++++ b/ErsatzTV.Core/Next/Config/ChannelConfig.cs
+@@ -322,11 +322,30 @@ public partial class Subtitle
+         public string? ForceStyle { get; set; }
+ 
+         /// <summary>
+-        /// What to do with the selected text subtitle track. Image subtitles are always burned in.
++        /// What to do with the selected subtitle track. Image subtitles are burned unless
++        /// `mode` is `mux`.
+         /// </summary>
+         [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+         [JsonPropertyName("mode")]
+         public SubtitleMode? Mode { get; set; }
++
++        /// <summary>
++        /// Subtitle tracks to mux, in order. The first entry describes the primary track; each
++        /// further entry is filled from the playout item's `tracks.extra_subtitle`. Empty leaves
++        /// burn/convert behavior unchanged.
++        /// </summary>
++        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
++        [JsonPropertyName("tracks")]
++        public List<SubtitleTrack>? Tracks { get; set; }
++    }
++
++    public partial class SubtitleTrack
++    {
++        [JsonPropertyName("language")]
++        public string? Language { get; set; }
++
++        [JsonPropertyName("title")]
++        public string? Title { get; set; }
+     }
+ 
+     /// <summary>
+@@ -741,13 +760,16 @@ public enum AudioFormat { Aac, Ac3 };
+     public enum StreamMode { Copy, Transcode };
+ 
+     /// <summary>
+-    /// What to do with the selected text subtitle track. Image subtitles are always burned in.
++    /// What to do with the selected subtitle track.
+     ///
+     /// Burn subtitles into the video.
+     ///
+     /// Convert text subtitles to a WebVTT track in the HLS stream.
++    ///
++    /// Mux subtitle streams into the MPEG-TS output (selectable tracks). Prefer image
++    /// subtitles (PGS/DVD/DVB); text-to-dvdsub is not supported by ffmpeg.
+     /// </summary>
+-    public enum SubtitleMode { Burn, Convert };
++    public enum SubtitleMode { Burn, Convert, Mux };
+ 
+     /// <summary>
+     /// AMD AMF. Windows only.
+@@ -974,6 +996,8 @@ public override SubtitleMode Read(ref Utf8JsonReader reader, Type typeToConvert,
+                     return SubtitleMode.Burn;
+                 case "convert":
+                     return SubtitleMode.Convert;
++                case "mux":
++                    return SubtitleMode.Mux;
+             }
+             throw new Exception("Cannot unmarshal type SubtitleMode");
+         }
+@@ -988,6 +1012,9 @@ public override void Write(Utf8JsonWriter writer, SubtitleMode value, JsonSerial
+                 case SubtitleMode.Convert:
+                     JsonSerializer.Serialize(writer, "convert", options);
+                     return;
++                case SubtitleMode.Mux:
++                    JsonSerializer.Serialize(writer, "mux", options);
++                    return;
+             }
+             throw new Exception("Cannot marshal type SubtitleMode");
+         }
+diff --git a/ErsatzTV.Core/Next/Playout.cs b/ErsatzTV.Core/Next/Playout.cs
+index af656576..15d03940 100644
+--- a/ErsatzTV.Core/Next/Playout.cs
++++ b/ErsatzTV.Core/Next/Playout.cs
+@@ -948,6 +948,16 @@ public partial class PlayoutItemTracks
+         [JsonPropertyName("subtitle")]
+         public TrackSelection? Subtitle { get; set; }
+ 
++        /// <summary>
++        /// Subtitle tracks to mux after the primary `subtitle` track, filling the channel's
++        /// `normalization.subtitle.tracks` slots in order. Each is read from the same source as the
++        /// primary subtitle when possible. Slots without a matching language reuse the primary
++        /// stream index so every item keeps the same layout.
++        /// </summary>
++        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
++        [JsonPropertyName("extra_subtitle")]
++        public List<ExtraSubtitleTrack>? ExtraSubtitle { get; set; }
++
+         /// <summary>
+         /// Video track selection.
+         /// </summary>
+@@ -955,6 +965,18 @@ public partial class PlayoutItemTracks
+         public TrackSelection? Video { get; set; }
+     }
+ 
++    /// <summary>
++    /// Fills one extra subtitle slot.
++    /// </summary>
++    public partial class ExtraSubtitleTrack
++    {
++        /// <summary>
++        /// Subtitle stream within the primary subtitle track's source.
++        /// </summary>
++        [JsonPropertyName("stream_index")]
++        public long? StreamIndex { get; set; }
++    }
++
+     /// <summary>
+     /// Selects a single track (video or audio).
+     ///
+diff --git a/ErsatzTV.Infrastructure.MySql/Migrations/20261122170010_Add_ChannelNextEngineSubtitleLanguages.cs b/ErsatzTV.Infrastructure.MySql/Migrations/20261122170010_Add_ChannelNextEngineSubtitleLanguages.cs
+new file mode 100644
+index 00000000..39ffe19e
+--- /dev/null
++++ b/ErsatzTV.Infrastructure.MySql/Migrations/20261122170010_Add_ChannelNextEngineSubtitleLanguages.cs
+@@ -0,0 +1,29 @@
++using Microsoft.EntityFrameworkCore.Migrations;
++
++#nullable disable
++
++namespace ErsatzTV.Infrastructure.MySql.Migrations
++{
++    /// <inheritdoc />
++    public partial class Add_ChannelNextEngineSubtitleLanguages : Migration
++    {
++        /// <inheritdoc />
++        protected override void Up(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.AddColumn<string>(
++                name: "NextEngineSubtitleLanguages",
++                table: "Channel",
++                type: "longtext",
++                nullable: true)
++                .Annotation("MySql:CharSet", "utf8mb4");
++        }
++
++        /// <inheritdoc />
++        protected override void Down(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.DropColumn(
++                name: "NextEngineSubtitleLanguages",
++                table: "Channel");
++        }
++    }
++}
+diff --git a/ErsatzTV.Infrastructure.MySql/Migrations/TvContextModelSnapshot.cs b/ErsatzTV.Infrastructure.MySql/Migrations/TvContextModelSnapshot.cs
+index 879b9997..c6fbb0da 100644
+--- a/ErsatzTV.Infrastructure.MySql/Migrations/TvContextModelSnapshot.cs
++++ b/ErsatzTV.Infrastructure.MySql/Migrations/TvContextModelSnapshot.cs
+@@ -337,6 +337,9 @@ protected override void BuildModel(ModelBuilder modelBuilder)
+                     b.Property<string>("NextEngineAudioLanguages")
+                         .HasColumnType("longtext");
+ 
++                    b.Property<string>("NextEngineSubtitleLanguages")
++                        .HasColumnType("longtext");
++
+                     b.Property<int>("NextEngineTextSubtitleMode")
+                         .HasColumnType("int");
+ 
+diff --git a/ErsatzTV.Infrastructure.Sqlite/Migrations/20261122170000_Add_ChannelNextEngineSubtitleLanguages.cs b/ErsatzTV.Infrastructure.Sqlite/Migrations/20261122170000_Add_ChannelNextEngineSubtitleLanguages.cs
+new file mode 100644
+index 00000000..7a962827
+--- /dev/null
++++ b/ErsatzTV.Infrastructure.Sqlite/Migrations/20261122170000_Add_ChannelNextEngineSubtitleLanguages.cs
+@@ -0,0 +1,28 @@
++using Microsoft.EntityFrameworkCore.Migrations;
++
++#nullable disable
++
++namespace ErsatzTV.Infrastructure.Sqlite.Migrations
++{
++    /// <inheritdoc />
++    public partial class Add_ChannelNextEngineSubtitleLanguages : Migration
++    {
++        /// <inheritdoc />
++        protected override void Up(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.AddColumn<string>(
++                name: "NextEngineSubtitleLanguages",
++                table: "Channel",
++                type: "TEXT",
++                nullable: true);
++        }
++
++        /// <inheritdoc />
++        protected override void Down(MigrationBuilder migrationBuilder)
++        {
++            migrationBuilder.DropColumn(
++                name: "NextEngineSubtitleLanguages",
++                table: "Channel");
++        }
++    }
++}
+diff --git a/ErsatzTV.Infrastructure.Sqlite/Migrations/TvContextModelSnapshot.cs b/ErsatzTV.Infrastructure.Sqlite/Migrations/TvContextModelSnapshot.cs
+index a6abc1fa..a80b4515 100644
+--- a/ErsatzTV.Infrastructure.Sqlite/Migrations/TvContextModelSnapshot.cs
++++ b/ErsatzTV.Infrastructure.Sqlite/Migrations/TvContextModelSnapshot.cs
+@@ -324,6 +324,9 @@ protected override void BuildModel(ModelBuilder modelBuilder)
+                     b.Property<string>("NextEngineAudioLanguages")
+                         .HasColumnType("TEXT");
+ 
++                    b.Property<string>("NextEngineSubtitleLanguages")
++                        .HasColumnType("TEXT");
++
+                     b.Property<int>("NextEngineTextSubtitleMode")
+                         .HasColumnType("INTEGER");
+ 
+diff --git a/ErsatzTV.Infrastructure/Scheduling/PlayoutItemConverter.cs b/ErsatzTV.Infrastructure/Scheduling/PlayoutItemConverter.cs
+index 38fe0ec4..6a9be6af 100644
+--- a/ErsatzTV.Infrastructure/Scheduling/PlayoutItemConverter.cs
++++ b/ErsatzTV.Infrastructure/Scheduling/PlayoutItemConverter.cs
+@@ -37,7 +37,7 @@ public class PlayoutItemConverter(
+     IDbContextFactory<TvContext> dbContextFactory,
+     ILogger<PlayoutItemConverter> logger) : IPlayoutItemConverter
+ {
+-    public static readonly string PlayoutVersion = "https://ersatztv.org/playout/version/0.0.9";
++    public static readonly string PlayoutVersion = "https://ersatztv.org/playout/version/0.0.10";
+ 
+     public async Task<Option<Core.Next.PlayoutItem>> ToNext(
+         string channelNumber,
+@@ -225,6 +225,7 @@ playoutItem.MediaItem is not RemoteStream && playoutItem.MediaItem is not Image
+ 
+                 // the first channel audio language labels the primary track, so it must select it
+                 List<string> audioLanguages = ChannelAudioLanguages.Parse(channel.NextEngineAudioLanguages);
++                List<string> subtitleLanguages = ChannelSubtitleLanguages.Parse(channel.NextEngineSubtitleLanguages);
+                 await SelectTracks(
+                     channel,
+                     playoutItem,
+@@ -234,12 +235,22 @@ await SelectTracks(
+                         ? audioLanguages[0]
+                         : playoutItem.PreferredAudioLanguageCode ?? channel.PreferredAudioLanguageCode,
+                     playoutItem.PreferredAudioTitle ?? channel.PreferredAudioTitle,
+-                    playoutItem.PreferredSubtitleLanguageCode ?? channel.PreferredSubtitleLanguageCode,
++                    subtitleLanguages.Count > 0
++                        ? subtitleLanguages[0]
++                        : playoutItem.PreferredSubtitleLanguageCode ?? channel.PreferredSubtitleLanguageCode,
+                     playoutItem.SubtitleMode ?? channel.SubtitleMode,
+                     subtitles,
+                     shouldLogMessages,
+                     cancellationToken);
+                 SelectExtraAudio(audioLanguages, headVersion, nextPlayoutItem, shouldLogMessages);
++                await SelectExtraSubtitle(
++                    subtitleLanguages,
++                    channel,
++                    playoutItem,
++                    nextPlayoutItem,
++                    subtitles,
++                    shouldLogMessages,
++                    cancellationToken);
+                 SelectGraphics(
+                     maybeGlobalWatermark,
+                     channel,
+@@ -652,6 +663,90 @@ private void SelectExtraAudio(
+             .ToList();
+     }
+ 
++    // Mux mode has no silent filler; reuse the primary subtitle stream index so the layout
++    // stays stable. Prefer embedded image subs (PGS/DVD) — text cannot be encoded to dvdsub.
++    private async Task SelectExtraSubtitle(
++        List<string> subtitleLanguages,
++        Channel channel,
++        PlayoutItem playoutItem,
++        Core.Next.PlayoutItem nextPlayoutItem,
++        Option<List<Subtitle>> subtitles,
++        bool shouldLogMessages,
++        CancellationToken cancellationToken)
++    {
++        if (subtitleLanguages.Count < 2)
++        {
++            return;
++        }
++
++        long? primaryIndex = nextPlayoutItem.Tracks?.Subtitle?.StreamIndex;
++        if (primaryIndex is null)
++        {
++            return;
++        }
++
++        List<Subtitle> allSubtitles = (await subtitles.IfNoneAsync(() => GetSubtitles(
++            channel,
++            playoutItem.MediaItem,
++            playoutItem.Id,
++            playoutItem.InPoint))).ToList();
++        allSubtitles.RemoveAll(s => s.IsImage && s.SubtitleKind is not SubtitleKind.Embedded);
++
++        nextPlayoutItem.Tracks.ExtraSubtitle = subtitleLanguages
++            .Skip(1)
++            .Select(language =>
++            {
++                Option<Subtitle> match = SelectSubtitleForLanguage(allSubtitles, language, preferImage: true);
++                long index = match.Map(s => (long)s.StreamIndex).IfNone(primaryIndex.Value);
++                if (shouldLogMessages && match.IsNone)
++                {
++                    logger.LogDebug(
++                        "No subtitle for language {Language}; reusing primary stream {Index}",
++                        language,
++                        primaryIndex.Value);
++                }
++
++                return new Core.Next.ExtraSubtitleTrack { StreamIndex = index };
++            })
++            .ToList();
++    }
++
++    private static Option<Subtitle> SelectSubtitleForLanguage(
++        List<Subtitle> subtitles,
++        string language,
++        bool preferImage)
++    {
++        var codes = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase) { language };
++        // also match common two-letter forms when a three-letter code was configured
++        if (language.Length == 3)
++        {
++            try
++            {
++                var culture = CultureInfo.GetCultures(CultureTypes.NeutralCultures)
++                    .FirstOrDefault(c =>
++                        string.Equals(c.ThreeLetterISOLanguageName, language, StringComparison.OrdinalIgnoreCase));
++                if (culture is not null)
++                {
++                    codes.Add(culture.TwoLetterISOLanguageName);
++                }
++            }
++            catch (CultureNotFoundException)
++            {
++                // ignore
++            }
++        }
++
++        IEnumerable<Subtitle> matching = subtitles.Where(s =>
++            !string.IsNullOrWhiteSpace(s.Language) && codes.Contains(s.Language));
++
++        if (preferImage)
++        {
++            matching = matching.OrderByDescending(s => s.IsImage);
++        }
++
++        return Optional(matching.FirstOrDefault());
++    }
++
+     private Option<Core.Next.Source> SubtitleSource(
+         PlayoutItem playoutItem,
+         Subtitle subtitle,
+diff --git a/ErsatzTV.Tests/Streaming/ChannelConfigConverterTests.cs b/ErsatzTV.Tests/Streaming/ChannelConfigConverterTests.cs
+index 6bc42f7d..d76aa627 100644
+--- a/ErsatzTV.Tests/Streaming/ChannelConfigConverterTests.cs
++++ b/ErsatzTV.Tests/Streaming/ChannelConfigConverterTests.cs
+@@ -38,6 +38,7 @@ public class ChannelConfigConverterTests
+         StreamingEngine: StreamingEngine.Next,
+         NextEngineTextSubtitleMode: default,
+         NextEngineAudioLanguages: null!,
++        NextEngineSubtitleLanguages: null!,
+         StreamingMode: StreamingMode.HttpLiveStreamingSegmenter,
+         WatermarkId: null,
+         FallbackFillerId: null,
+diff --git a/ErsatzTV/Pages/ChannelEditor.razor b/ErsatzTV/Pages/ChannelEditor.razor
+index cb634006..1f6e82ec 100644
+--- a/ErsatzTV/Pages/ChannelEditor.razor
++++ b/ErsatzTV/Pages/ChannelEditor.razor
+@@ -149,6 +149,15 @@ else
+                   Placeholder="eng, spa"
+                   HelperText="Three-letter language codes, one output audio track each. The first is the main track and replaces the preferred audio language. Items without a language get the main track's audio in that slot."/>
+ </MudStack>
++<MudStack Row="true" Breakpoint="Breakpoint.SmAndDown" Class="form-field-stack gap-md-8 mb-5">
++    <div class="d-flex">
++        <MudText>Subtitle Track Languages</MudText>
++    </div>
++    <MudTextField @bind-Value="_model.NextEngineSubtitleLanguages"
++                  For="@(() => _model.NextEngineSubtitleLanguages)"
++                  Placeholder="eng, hun"
++                  HelperText="Three-letter language codes, one muxed subtitle track each (MPEG-TS). Prefer PGS/DVD/DVB image subtitles — text cannot be converted to dvdsub. When set, subtitles are muxed instead of burned. Missing languages reuse the primary stream."/>
++</MudStack>
+ <MudStack Row="true" Breakpoint="Breakpoint.SmAndDown" Class="form-field-stack gap-md-8 mb-5">
+     <div class="d-flex">
+         <MudText>Streaming Mode</MudText>
+@@ -431,6 +440,7 @@ else
+                         _model.StreamingEngine = StreamingEngine.Next;
+                         _model.NextEngineTextSubtitleMode = channelViewModel.NextEngineTextSubtitleMode;
+                         _model.NextEngineAudioLanguages = channelViewModel.NextEngineAudioLanguages;
++                        _model.NextEngineSubtitleLanguages = channelViewModel.NextEngineSubtitleLanguages;
+                         _model.StreamingMode = channelViewModel.StreamingMode;
+                         _model.StreamSelectorMode = channelViewModel.StreamSelectorMode;
+                         _model.StreamSelector = channelViewModel.StreamSelector;
+diff --git a/ErsatzTV/Validators/ChannelEditViewModelValidator.cs b/ErsatzTV/Validators/ChannelEditViewModelValidator.cs
+index 414caf1c..3d8c68a5 100644
+--- a/ErsatzTV/Validators/ChannelEditViewModelValidator.cs
++++ b/ErsatzTV/Validators/ChannelEditViewModelValidator.cs
+@@ -30,6 +30,11 @@ public ChannelEditViewModelValidator()
+                 .All(l => l.Length == 3 && l.All(char.IsAsciiLetterLower)))
+             .WithMessage("Use three-letter language codes separated by commas, e.g. eng, spa");
+ 
++        RuleFor(x => x.NextEngineSubtitleLanguages)
++            .Must(languages => ChannelSubtitleLanguages.Parse(languages)
++                .All(l => l.Length == 3 && l.All(char.IsAsciiLetterLower)))
++            .WithMessage("Use three-letter language codes separated by commas, e.g. eng, hun");
++
+         RuleFor(x => x.EndCreditsKeepSeconds).InclusiveBetween(0, 3600);
+ 
+         When(
+diff --git a/ErsatzTV/ViewModels/ChannelEditViewModel.cs b/ErsatzTV/ViewModels/ChannelEditViewModel.cs
+index afbd7efb..a038938d 100644
+--- a/ErsatzTV/ViewModels/ChannelEditViewModel.cs
++++ b/ErsatzTV/ViewModels/ChannelEditViewModel.cs
+@@ -46,6 +46,7 @@ public StreamingEngine StreamingEngine
+ 
+     public NextEngineTextSubtitleMode NextEngineTextSubtitleMode { get; set; }
+     public string NextEngineAudioLanguages { get; set; }
++    public string NextEngineSubtitleLanguages { get; set; }
+     public StreamingMode StreamingMode { get; set; }
+     public int? WatermarkId { get; set; }
+     public int? FallbackFillerId { get; set; }
+@@ -92,6 +93,7 @@ public UpdateChannel ToUpdate() =>
+             StreamingEngine,
+             NextEngineTextSubtitleMode,
+             NextEngineAudioLanguages,
++            NextEngineSubtitleLanguages,
+             StreamingMode,
+             WatermarkId,
+             FallbackFillerId,
+@@ -129,6 +131,7 @@ public CreateChannel ToCreate() =>
+             StreamingEngine,
+             NextEngineTextSubtitleMode,
+             NextEngineAudioLanguages,
++            NextEngineSubtitleLanguages,
+             StreamingMode,
+             WatermarkId,
+             FallbackFillerId,
+-- 
+2.54.0 (Apple Git-157)
+
