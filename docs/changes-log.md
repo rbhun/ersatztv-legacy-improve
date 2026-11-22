@@ -3544,3 +3544,11 @@ Added `deploy/`: the ErsatzTV host pulls this public repo (and the public Legacy
 builds or pulls the fork image, then merges schedules through `/opt/ersatztv/local/` so personal
 overrides survive updates. `bootstrap.sh` wires `/opt/ersatztv-deploy` + `/opt/ersatztv/local`;
 `ersatztv-update` is the everyday entry point. No LAN addresses or tokens in the new files.
+
+## 2026-11-22 (2) — Single public repo for all improvements
+
+Deploy no longer depends on separate `rbhun/ersatztv` / `rbhun/ersatztv-next` forks. Code
+improvements live as `patches/legacy` and `patches/next` against the upstream tags in
+`versions.env`. The target clones official upstream, applies the patches, and builds. Station
+schedules, deploy scripts, and patches are one public repo; personal overlays stay in
+`/opt/ersatztv/local/`.

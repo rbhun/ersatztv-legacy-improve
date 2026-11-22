@@ -1,25 +1,15 @@
 # Copy to /opt/ersatztv/local/env on the target and edit.
 # This file is NEVER committed. The public repo only ships this example.
-#
-# update.sh sources it, then renders compose and decides what to build/pull.
 
 # Docker image name used by compose after a successful build or pull.
-# Keep the moving tag for everyday deploys; versioned tags stay for rollback.
 ETV_IMAGE=ersatztv:multi-audio
 
-# Optional rollback pin, e.g. ersatztv:v26.13.0-fork.cc32be95
-# ETV_IMAGE_PIN=
+# Upstream pins come from the public repo's versions.env; override here only
+# when testing a different base release.
+# LEGACY_TAG=v26.13.0
+# NEXT_TAG=v0.2.7
 
-# Upstream release the fork should sit on when building from GitHub.
-LEGACY_TAG=v26.13.0
-
-# Public fork remotes (no personal data — only code).
-ETV_REPO=https://github.com/rbhun/ersatztv.git
-ETV_BRANCH=multi-audio
-NEXT_REPO=https://github.com/rbhun/ersatztv-next.git
-NEXT_BRANCH=multi-audio
-
-# Where the public station/deploy repo lives on this host.
+# Where the public improvements repo lives on this host.
 DEPLOY_DIR=/opt/ersatztv-deploy
 
 # ErsatzTV runtime root (compose, config bind-mount, local overlay).
@@ -37,9 +27,8 @@ TZ=Europe/Budapest
 # VAAPI render node as seen inside the LXC. Do not assume renderD128.
 RENDER_NODE=/dev/dri/renderD129
 
-# How to get the image: build = clone public forks and build on this host;
-# pull = docker pull $ETV_IMAGE (for a registry you publish to separately).
+# build = clone upstream + apply patches from this repo; pull = docker pull only.
 IMAGE_MODE=build
 
-# Set to 1 to skip rebuilding when the fork SHAs have not changed.
+# Set to 1 to skip rebuilding when the patch set + upstream tags have not changed.
 SKIP_UNCHANGED_BUILD=1
