@@ -1,0 +1,15 @@
+[Unit]
+Description=ErsatzTV update agent (Health Check UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=ETV_DIR=/opt/ersatztv
+Environment=DEPLOY_DIR=/opt/ersatztv-deploy
+ExecStart=/usr/bin/python3 /opt/ersatztv-deploy/deploy/target/update-agent.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

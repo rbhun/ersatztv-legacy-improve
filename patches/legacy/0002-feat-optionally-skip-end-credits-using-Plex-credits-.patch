@@ -1,7 +1,7 @@
 From cc32be958d7b85810c8688260e8cad20ab894c4e Mon Sep 17 00:00:00 2001
 From: Balazs Rozgonyi <rbhun@me.com>
 Date: Fri, 20 Nov 2026 18:04:58 +0100
-Subject: [PATCH 2/2] feat: optionally skip end credits using Plex credits
+Subject: [PATCH 2/3] feat: optionally skip end credits using Plex credits
  markers
 
 Import Plex credits markers as MediaVersion.CreditsStart and add per-channel

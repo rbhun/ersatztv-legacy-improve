@@ -1,34 +1,26 @@
 # Copy to /opt/ersatztv/local/env on the target and edit.
 # This file is NEVER committed. The public repo only ships this example.
 
-# Docker image name used by compose after a successful build or pull.
 ETV_IMAGE=ersatztv:multi-audio
 
-# Upstream pins come from the public repo's versions.env; override here only
-# when testing a different base release.
-# LEGACY_TAG=v26.13.0
-# NEXT_TAG=v0.2.7
-
-# Where the public improvements repo lives on this host.
 DEPLOY_DIR=/opt/ersatztv-deploy
-
-# ErsatzTV runtime root (compose, config bind-mount, local overlay).
 ETV_DIR=/opt/ersatztv
-
-# Media library path inside the LXC (must match Plex).
 MEDIA_PATH=/mnt/media
-
-# HTTP port published to the LAN.
 ETV_PORT=8409
-
-# Wall-clock timezone for dayparts / watershed. Must match local time.
 TZ=Europe/Budapest
-
-# VAAPI render node as seen inside the LXC. Do not assume renderD128.
 RENDER_NODE=/dev/dri/renderD129
 
-# build = clone upstream + apply patches from this repo; pull = docker pull only.
 IMAGE_MODE=build
-
-# Set to 1 to skip rebuilding when the patch set + upstream tags have not changed.
 SKIP_UNCHANGED_BUILD=1
+
+# Health Check update agent (host process the container calls).
+UPDATE_AGENT_BIND=0.0.0.0
+UPDATE_AGENT_PORT=8410
+# Shared secret — put a long random string here; compose injects it into the container.
+UPDATE_AGENT_TOKEN=change-me
+# How the container reaches the host agent.
+UPDATE_AGENT_URL=http://host.docker.internal:8410
+
+# Selectable update sources for the Health Check UI.
+# id|Label|git-url|branch ; … (semicolon-separated)
+UPDATE_SOURCES=improvements|Improvements|https://github.com/rbhun/ersatztv-legacy-improve.git|main

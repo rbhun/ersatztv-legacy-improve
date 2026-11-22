@@ -3552,3 +3552,10 @@ improvements live as `patches/legacy` and `patches/next` against the upstream ta
 `versions.env`. The target clones official upstream, applies the patches, and builds. Station
 schedules, deploy scripts, and patches are one public repo; personal overlays stay in
 `/opt/ersatztv/local/`.
+
+## 2026-11-22 (3) — Health Check update UI + host agent
+
+Added `deploy/target/update-agent.py` and a systemd unit so the ErsatzTV Health Checks
+page can poll for updates every 10s, select a configured repo/branch, and trigger
+`update.sh`. Updates backup and restore `/opt/ersatztv/local` (and re-apply the overlay)
+so personal schedules/env survive. New legacy patch 0003 adds the UI client.

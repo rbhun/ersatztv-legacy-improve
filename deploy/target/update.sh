@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Pull the public deploy repo, refresh the fork image, apply the local overlay,
-# render compose, and restart ErsatzTV.
+# Pull the public deploy repo, refresh the image, apply the local overlay,
+# render compose, and restart ErsatzTV — preserving /opt/ersatztv/local.
 #
 # usage:
 #   update.sh              # pull + build/pull image + overlay + restart
@@ -26,12 +26,49 @@ for arg in "$@"; do
     esac
 done
 
-# Bootstrap defaults before local/env exists.
 ETV_DIR="${ETV_DIR:-/opt/ersatztv}"
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/ersatztv-deploy}"
-LOCAL_ENV="${ETV_DIR}/local/env"
+LOCAL_DIR="${ETV_DIR}/local"
+LOCAL_ENV="${LOCAL_DIR}/env"
+BACKUP_DIR="${ETV_DIR}/.local-backup"
 
-[ -f "$LOCAL_ENV" ] || die "missing ${LOCAL_ENV} — copy deploy/local.example/ to ${ETV_DIR}/local/ and edit env"
+ensure_local() {
+    mkdir -p "${LOCAL_DIR}/schedules" "${LOCAL_DIR}/stream-selectors" "${LOCAL_DIR}/graphics"
+    example="${DEPLOY_DIR}/deploy/local.example"
+    if [ ! -f "$LOCAL_ENV" ] && [ -f "${example}/env" ]; then
+        echo "==> creating local/env from example"
+        cp "${example}/env" "$LOCAL_ENV"
+    fi
+}
+
+backup_local() {
+    echo "==> backing up local overlay"
+    rm -rf "$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR"
+    if [ -d "$LOCAL_DIR" ]; then
+        cp -a "$LOCAL_DIR" "${BACKUP_DIR}/local"
+    fi
+    if [ -d "${ETV_DIR}/config/sequential-schedules" ]; then
+        cp -a "${ETV_DIR}/config/sequential-schedules" "${BACKUP_DIR}/sequential-schedules"
+    fi
+    if [ -d "${ETV_DIR}/config/scripts/channel-stream-selectors" ]; then
+        cp -a "${ETV_DIR}/config/scripts/channel-stream-selectors" \
+            "${BACKUP_DIR}/channel-stream-selectors"
+    fi
+}
+
+restore_local() {
+    echo "==> restoring local overlay"
+    if [ ! -d "${BACKUP_DIR}/local" ]; then
+        return
+    fi
+    mkdir -p "$LOCAL_DIR"
+    # Copy every backed-up file back (fills gaps and recovers anything the pull replaced).
+    (cd "${BACKUP_DIR}/local" && tar cf - .) | (cd "$LOCAL_DIR" && tar xf -)
+}
+
+ensure_local
+[ -f "$LOCAL_ENV" ] || die "missing ${LOCAL_ENV} — copy deploy/local.example/ to ${LOCAL_DIR}/ and edit env"
 # shellcheck disable=SC1090
 set -a
 # shellcheck disable=SC1091
@@ -46,14 +83,20 @@ set +a
 : "${ETV_PORT:?}"
 : "${MEDIA_PATH:?}"
 : "${RENDER_NODE:=/dev/dri/renderD128}"
+: "${UPDATE_AGENT_URL:=http://host.docker.internal:8410}"
+: "${UPDATE_AGENT_TOKEN:=}"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 export DEPLOY_DIR ETV_DIR
+
+backup_local
 
 if [ "$DO_PULL" -eq 1 ]; then
     [ -d "$DEPLOY_DIR/.git" ] || die "${DEPLOY_DIR} is not a git checkout"
     echo "==> pulling ${DEPLOY_DIR}"
     git -C "$DEPLOY_DIR" pull --ff-only
+    # New example files may appear; never overwrite an existing env.
+    ensure_local
 fi
 
 render_compose() {
@@ -73,19 +116,22 @@ render_compose() {
     [ "$TMPFS_MB" -gt 4096 ] && TMPFS_MB=4096
     [ "$TMPFS_MB" -lt 1024 ] && TMPFS_MB=1024
 
-    export ETV_IMAGE TZ ETV_PORT ETV_DIR MEDIA_PATH RENDER_GID TMPFS_MB
-    # envsubst if available; otherwise a tiny python fallback.
+    export ETV_IMAGE TZ ETV_PORT ETV_DIR MEDIA_PATH RENDER_GID TMPFS_MB \
+        UPDATE_AGENT_URL UPDATE_AGENT_TOKEN
     if command -v envsubst >/dev/null 2>&1; then
-        envsubst '${ETV_IMAGE} ${TZ} ${ETV_PORT} ${ETV_DIR} ${MEDIA_PATH} ${RENDER_GID} ${TMPFS_MB}' \
+        envsubst '${ETV_IMAGE} ${TZ} ${ETV_PORT} ${ETV_DIR} ${MEDIA_PATH} ${RENDER_GID} ${TMPFS_MB} ${UPDATE_AGENT_URL} ${UPDATE_AGENT_TOKEN}' \
             < "$template" > "${ETV_DIR}/docker-compose.yml"
     else
         python3 - "$template" "${ETV_DIR}/docker-compose.yml" <<'PY'
 import os, sys
 src, dst = sys.argv[1], sys.argv[2]
-keys = ["ETV_IMAGE", "TZ", "ETV_PORT", "ETV_DIR", "MEDIA_PATH", "RENDER_GID", "TMPFS_MB"]
+keys = [
+    "ETV_IMAGE", "TZ", "ETV_PORT", "ETV_DIR", "MEDIA_PATH", "RENDER_GID", "TMPFS_MB",
+    "UPDATE_AGENT_URL", "UPDATE_AGENT_TOKEN",
+]
 text = open(src).read()
 for k in keys:
-    text = text.replace("${%s}" % k, os.environ[k])
+    text = text.replace("${%s}" % k, os.environ.get(k, ""))
 open(dst, "w").write(text)
 PY
     fi
@@ -126,15 +172,19 @@ do_restart() {
 case "$MODE" in
     all)
         do_image
+        restore_local
         do_overlay
         do_restart
         ;;
     overlay)
+        restore_local
         do_overlay
         echo "(compose/image unchanged)"
         ;;
     image)
         do_image
+        restore_local
+        do_overlay
         do_restart
         ;;
 esac
