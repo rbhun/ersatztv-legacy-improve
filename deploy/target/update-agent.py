@@ -10,7 +10,7 @@ Endpoints:
   GET  /v1/check?source=<id>
   GET  /v1/status
   GET  /v1/log
-  POST /v1/update   JSON {"source":"<id>"}
+  POST /v1/update?source=<id>   JSON {"source":"<id>"} (query or body)
 """
 from __future__ import annotations
 
@@ -294,10 +294,43 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_chunked(self) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                break
+            size_token = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_token, 16)
+            except ValueError:
+                break
+            if size == 0:
+                # Trailer + final CRLF
+                while True:
+                    trailer = self.rfile.readline()
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            chunks.append(self.rfile.read(size))
+            self.rfile.readline()  # chunk CRLF
+        return b"".join(chunks)
+
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
-        return json.loads(raw.decode("utf-8") or "{}")
+        length_hdr = self.headers.get("Content-Length")
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        try:
+            if length_hdr not in (None, ""):
+                length = int(length_hdr)
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+            elif "chunked" in te:
+                raw = self._read_chunked() or b"{}"
+            else:
+                raw = b"{}"
+            return json.loads(raw.decode("utf-8") or "{}")
+        except Exception as exc:  # noqa: BLE001
+            append_log(f"failed to parse update JSON body: {exc}")
+            return {}
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
@@ -359,9 +392,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not found"})
         if not self._authorized():
             return self._json(401, {"error": "unauthorized"})
+        qs = urllib.parse.parse_qs(parsed.query)
         body = self._read_json()
-        source_id = body.get("source")
+        # Prefer query string — some HttpClients send chunked JSON without a
+        # Content-Length that BaseHTTPRequestHandler can read as a body.
+        source_id = (qs.get("source") or [None])[0] or body.get("source")
         if not source_id:
+            append_log(f"update rejected: source missing (query={dict(qs)} body={body})")
             return self._json(400, {"error": "source required"})
 
         def worker() -> None:

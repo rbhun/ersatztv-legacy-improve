@@ -1,0 +1,41 @@
+From 4849331176c950bdd3ef55a41b9e932332bc5dc3 Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 14:37:42 +0100
+Subject: [PATCH] fix: pass update source as query string to host agent
+
+POST JSON bodies from HttpClient were arriving empty at the Python
+agent (chunked/no Content-Length), causing "source required".
+
+Co-authored-by: rbhun <rbhun@users.noreply.github.com>
+---
+ .../Updates/UpdateAgentClient.cs                   | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/ErsatzTV.Infrastructure/Updates/UpdateAgentClient.cs b/ErsatzTV.Infrastructure/Updates/UpdateAgentClient.cs
+index 2b85a176..0f2d6c5b 100644
+--- a/ErsatzTV.Infrastructure/Updates/UpdateAgentClient.cs
++++ b/ErsatzTV.Infrastructure/Updates/UpdateAgentClient.cs
+@@ -66,11 +66,15 @@ public async Task<Either<BaseError, UpdateStartResponse>> StartUpdate(
+         try
+         {
+             using HttpClient client = CreateClient();
+-            using HttpResponseMessage response = await client.PostAsJsonAsync(
+-                "/v1/update",
+-                new { source = sourceId },
+-                JsonOptions,
+-                cancellationToken);
++            // Put source in the query string and JSON body. The host agent's
++            // BaseHTTPRequestHandler often misses chunked POST bodies.
++            string path = $"/v1/update?source={Uri.EscapeDataString(sourceId)}";
++            var payload = new Dictionary<string, string> { ["source"] = sourceId };
++            using var content = new StringContent(
++                JsonSerializer.Serialize(payload, JsonOptions),
++                System.Text.Encoding.UTF8,
++                "application/json");
++            using HttpResponseMessage response = await client.PostAsync(path, content, cancellationToken);
+             string body = await response.Content.ReadAsStringAsync(cancellationToken);
+             if (!response.IsSuccessStatusCode)
+             {
+-- 
+2.54.0 (Apple Git-157)
+
