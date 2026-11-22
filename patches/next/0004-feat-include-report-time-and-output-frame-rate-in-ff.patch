@@ -1,0 +1,119 @@
+From af9e7bc4163426766cb178882849f97b8de14602 Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 18:13:51 +0100
+Subject: [PATCH] feat: include report time and output frame rate in ffmpeg
+ progress
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ .../ersatztv-channel/src/channel_session.rs   |  5 +++--
+ crates/ersatztv-channel/src/progress.rs       | 22 +++++++++++++++----
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/crates/ersatztv-channel/src/channel_session.rs b/crates/ersatztv-channel/src/channel_session.rs
+index 4a4b9e5..a6213cc 100644
+--- a/crates/ersatztv-channel/src/channel_session.rs
++++ b/crates/ersatztv-channel/src/channel_session.rs
+@@ -807,8 +807,8 @@ impl ChannelSession {
+                 .ok()
+                 .map(|v| v.frame_rate.clone())
+         });
+-        if let Some(frame_rate) = output_frame_rate
+-            && is_sub_frame(window, &frame_rate)
++        if let Some(frame_rate) = &output_frame_rate
++            && is_sub_frame(window, frame_rate)
+         {
+             // with -shortest, h264_vaapi segfaults when -t is under one frame
+             log::debug!(
+@@ -960,6 +960,7 @@ impl ChannelSession {
+                     pid: ffmpeg_child.id(),
+                     realtime,
+                     output_start,
++                    frame_rate: output_frame_rate.as_ref().map(|f| f.r_frame_rate.as_str()),
+                     args: &args,
+                 },
+             );
+diff --git a/crates/ersatztv-channel/src/progress.rs b/crates/ersatztv-channel/src/progress.rs
+index a9dd053..7519c87 100644
+--- a/crates/ersatztv-channel/src/progress.rs
++++ b/crates/ersatztv-channel/src/progress.rs
+@@ -18,6 +18,8 @@ pub struct ProgressHeader<'a> {
+     pub realtime: bool,
+     /// wall clock time of the first output frame
+     pub output_start: OffsetDateTime,
++    /// ffmpeg omits `-r` when the source already has the output frame rate
++    pub frame_rate: Option<&'a str>,
+     pub args: &'a [Cow<'a, str>],
+ }
+ 
+@@ -37,9 +39,17 @@ pub fn spawn_progress_writer(
+             let mut block = String::new();
+             let mut seq: u64 = 0;
+             while let Ok(Some(line)) = lines.next_line().await {
++                let is_end_of_report = line.starts_with("progress=");
++                if is_end_of_report {
++                    // the host reads reports at its own pace, so it needs their wall clock time
++                    block.push_str(&format!(
++                        "reported_at={}\n",
++                        unix_ms(OffsetDateTime::now_utc())
++                    ));
++                }
+                 block.push_str(&line);
+                 block.push('\n');
+-                if line.starts_with("progress=") {
++                if is_end_of_report {
+                     seq += 1;
+                     let body = format!("{header}seq={seq}\n{block}");
+                     if let Err(e) = write_atomic(&output_folder, &dest, body).await {
+@@ -62,12 +72,13 @@ impl ProgressHeader<'_> {
+             .collect::<Vec<_>>()
+             .join(" ");
+         format!(
+-            "item_id={}\npid={}\nstarted_at={}\noutput_start={}\nrealtime={}\nargs={args}\n",
++            "item_id={}\npid={}\nstarted_at={}\noutput_start={}\nrealtime={}\nframe_rate={}\nargs={args}\n",
+             self.item_id.replace(['\n', '\r'], " "),
+             self.pid.map(|p| p.to_string()).unwrap_or_default(),
+             unix_ms(started_at),
+             unix_ms(self.output_start),
+             self.realtime,
++            self.frame_rate.unwrap_or_default(),
+         )
+     }
+ }
+@@ -104,6 +115,7 @@ mod tests {
+             pid: Some(7),
+             realtime: true,
+             output_start: datetime!(2026-01-01 00:00:01 UTC),
++            frame_rate: Some("24000/1001"),
+             args: &args,
+         };
+ 
+@@ -112,7 +124,7 @@ mod tests {
+         assert_eq!(
+             rendered,
+             "item_id=42\npid=7\nstarted_at=1767225600000\noutput_start=1767225601000\nrealtime=true\n\
+-             args=-i \"/media/My Movie.mkv\" -vf \"drawtext=text=\\\"hi\\\"\"\n"
++             frame_rate=24000/1001\nargs=-i \"/media/My Movie.mkv\" -vf \"drawtext=text=\\\"hi\\\"\"\n"
+         );
+     }
+ 
+@@ -130,6 +142,7 @@ mod tests {
+                 pid: None,
+                 realtime: false,
+                 output_start: OffsetDateTime::now_utc(),
++                frame_rate: None,
+                 args: &args,
+             },
+         )
+@@ -138,6 +151,7 @@ mod tests {
+ 
+         let contents = std::fs::read_to_string(folder.path().join(PROGRESS_FILE_NAME)).unwrap();
+         assert!(contents.contains("\npid=\n"));
+-        assert!(contents.ends_with("args=-i in.mkv\nseq=2\nframe=20\nprogress=end\n"));
++        assert!(contents.contains("\nframe_rate=\nargs=-i in.mkv\nseq=2\nframe=20\nreported_at="));
++        assert!(contents.ends_with("\nprogress=end\n"));
+     }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

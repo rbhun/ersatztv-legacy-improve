@@ -1,0 +1,551 @@
+From 21402545424bf3aec5a6f129da34e7afa0bafaca Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 18:17:15 +0100
+Subject: [PATCH] fix: detect Next encoder, filters, frame rate and bitrate on
+ performance page
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+Co-authored-by: rbhun <rbhun@users.noreply.github.com>
+---
+ .../Streaming/NextSessionWorker.cs            | 60 +++++++++++++++--
+ .../FFmpeg/FFmpegAccelerationInfoTests.cs     | 17 +++++
+ .../FFmpeg/FFmpegProgressTests.cs             | 16 +++++
+ .../FFmpeg/HlsSegmentBitrateTests.cs          | 65 +++++++++++++++++++
+ .../FFmpeg/NextProgressReportTests.cs         |  8 ++-
+ .../FFmpeg/FFmpegAccelerationInfo.cs          | 39 +++++++----
+ ErsatzTV.Core/FFmpeg/FFmpegProgress.cs        | 11 +++-
+ .../FFmpeg/FFmpegTranscodeMonitor.cs          |  9 ++-
+ ErsatzTV.Core/FFmpeg/HlsSegmentBitrate.cs     | 55 ++++++++++++++++
+ ErsatzTV.Core/FFmpeg/NextProgressReport.cs    |  2 +
+ 10 files changed, 260 insertions(+), 22 deletions(-)
+ create mode 100644 ErsatzTV.Core.Tests/FFmpeg/HlsSegmentBitrateTests.cs
+ create mode 100644 ErsatzTV.Core/FFmpeg/HlsSegmentBitrate.cs
+
+diff --git a/ErsatzTV.Application/Streaming/NextSessionWorker.cs b/ErsatzTV.Application/Streaming/NextSessionWorker.cs
+index c8930501..cd792f1e 100644
+--- a/ErsatzTV.Application/Streaming/NextSessionWorker.cs
++++ b/ErsatzTV.Application/Streaming/NextSessionWorker.cs
+@@ -24,6 +24,7 @@ public class NextSessionWorker(
+     : IHlsSessionWorker
+ {
+     private const int MaxPerformanceHistory = 25;
++    private const string FFmpegPlaylistFileName = "ffmpeg.m3u8";
+ 
+     private readonly TimeSpan _checkpointThreshold = TimeSpan.FromMinutes(5);
+     private readonly Lock _performanceSync = new();
+@@ -132,7 +133,10 @@ public HlsSessionPerformanceModel GetPerformance()
+             double? bufferSeconds = null;
+             if (_currentTranscode is not null)
+             {
+-                current = WithMediaItem(_currentTranscode.ItemId, _currentTranscode.Monitor.GetPerformance());
++                current = WithSegmentBitrate(
++                    WithMediaItem(_currentTranscode.ItemId, _currentTranscode.Monitor.GetPerformance()),
++                    _currentTranscode.StartedAt,
++                    null);
+                 foreach (DateTimeOffset until in _currentTranscode.Monitor.TranscodedUntil)
+                 {
+                     bufferSeconds = (until - DateTimeOffset.Now).TotalSeconds;
+@@ -177,7 +181,7 @@ private void RefreshTranscode()
+             {
+                 if (_currentTranscode is not null)
+                 {
+-                    FinishTranscode(_currentTranscode, succeeded: null);
++                    FinishTranscode(_currentTranscode, succeeded: null, report.StartedAt);
+                 }
+ 
+                 var monitor = new FFmpegTranscodeMonitor(
+@@ -186,7 +190,8 @@ private void RefreshTranscode()
+                     false,
+                     report.OutputStart,
+                     report.Arguments,
+-                    report.StartedAt);
++                    report.StartedAt,
++                    report.FrameRate);
+                 if (report.ProcessId is { } processId)
+                 {
+                     monitor.AttachProcess(processId);
+@@ -213,7 +218,7 @@ private void RefreshTranscode()
+         }
+     }
+ 
+-    private void FinishTranscode(NextTranscode transcode, bool? succeeded)
++    private void FinishTranscode(NextTranscode transcode, bool? succeeded, DateTimeOffset nextStartedAt)
+     {
+         if (!transcode.IsEnded)
+         {
+@@ -221,13 +226,58 @@ private void FinishTranscode(NextTranscode transcode, bool? succeeded)
+         }
+ 
+         transcode.Monitor.Dispose();
+-        _performanceHistory.AddFirst((transcode.ItemId, transcode.Monitor.GetPerformance()));
++        FFmpegTranscodePerformance performance = WithSegmentBitrate(
++            transcode.Monitor.GetPerformance(),
++            transcode.StartedAt,
++            nextStartedAt);
++        _performanceHistory.AddFirst((transcode.ItemId, performance));
+         while (_performanceHistory.Count > MaxPerformanceHistory)
+         {
+             _performanceHistory.RemoveLast();
+         }
+     }
+ 
++    private FFmpegTranscodePerformance WithSegmentBitrate(
++        FFmpegTranscodePerformance performance,
++        DateTimeOffset writtenFrom,
++        DateTimeOffset? writtenUntil)
++    {
++        if (performance.Progress.BitrateKbps is not null)
++        {
++            return performance;
++        }
++
++        try
++        {
++            string playlist = fileSystem.File.ReadAllText(
++                fileSystem.Path.Combine(_workingDirectory, FFmpegPlaylistFileName));
++
++            (double? averageKbps, double? currentKbps) = HlsSegmentBitrate.Measure(
++                playlist,
++                segment =>
++                {
++                    IFileInfo info = fileSystem.FileInfo.New(fileSystem.Path.Combine(_workingDirectory, segment));
++                    return info.Exists ? (info.Length, new DateTimeOffset(info.LastWriteTimeUtc)) : null;
++                },
++                writtenFrom,
++                writtenUntil);
++
++            return performance with
++            {
++                Progress = performance.Progress with
++                {
++                    BitrateKbps = averageKbps,
++                    CurrentBitrateKbps = writtenUntil is null ? currentKbps : null
++                }
++            };
++        }
++        catch (Exception)
++        {
++            // playlist or segments replaced while reading
++            return performance;
++        }
++    }
++
+     private FFmpegTranscodePerformance WithMediaItem(string itemId, FFmpegTranscodePerformance performance) =>
+         _mediaItemIds.TryGetValue(itemId, out int? mediaItemId) && mediaItemId is not null
+             ? performance with { MediaItemId = mediaItemId }
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs b/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
+index 9b1092a5..4e30b613 100644
+--- a/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
++++ b/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
+@@ -28,6 +28,23 @@ public void Software_Decode_And_Encode()
+         result.VideoBitrate.ShouldBe("2000k");
+     }
+ 
++    [Test]
++    public void Next_Vaapi_With_Vcodec_And_Extra_Audio_Filter()
++    {
++        const string ARGUMENTS =
++            "-progress pipe:1 -init_hw_device vaapi=va:/dev/dri/renderD128 -filter_hw_device va -hwaccel vaapi -hwaccel_output_format vaapi -i /media/a.mkv -i /media/a.mkv -filter_complex \"[0:0]scale_vaapi=1920:1080:force_divisible_by=2,setsar=1[v]\" -filter_complex [1:2]aresample=async=1[a1] -map [v] -map [a1] -vcodec h264_vaapi -b:v 15000k -f hls live.m3u8";
++
++        FFmpegAccelerationInfo result = FFmpegAccelerationInfo.FromArguments(ARGUMENTS);
++
++        result.IsHardwareDecode.ShouldBeTrue();
++        result.VideoEncoder.ShouldBe("h264_vaapi");
++        result.IsHardwareEncode.ShouldBeTrue();
++        result.HardwareFilters.ShouldBe(["scale_vaapi"]);
++        result.OutputWidth.ShouldBe(1920);
++        result.OutputHeight.ShouldBe(1080);
++        result.OutputFrameRate.ShouldBeNull();
++    }
++
+     [Test]
+     public void Output_Size_Prefers_Pad_Over_Scale()
+     {
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs b/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
+index 8788b778..72f800da 100644
+--- a/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
++++ b/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
+@@ -75,6 +75,22 @@ public async Task Calculates_Current_Bitrate_Between_Reports()
+         progress.GetSnapshot().CurrentBitrateKbps.ShouldBe(6000);
+     }
+ 
++    [Test]
++    public void Current_Speed_Uses_Report_Time_When_Present()
++    {
++        var progress = new FFmpegProgress();
++        progress.ParseLine("out_time_us=10000000");
++        progress.ParseLine("reported_at=1000000");
++        progress.ParseLine("progress=continue");
++
++        // read back to back, but written 2 seconds apart
++        progress.ParseLine("out_time_us=12000000");
++        progress.ParseLine("reported_at=1002000");
++        progress.ParseLine("progress=continue");
++
++        progress.GetSnapshot().CurrentSpeed.ShouldBe(1.0);
++    }
++
+     [Test]
+     public void Parses_Legacy_Stats_Line_Speed()
+     {
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/HlsSegmentBitrateTests.cs b/ErsatzTV.Core.Tests/FFmpeg/HlsSegmentBitrateTests.cs
+new file mode 100644
+index 00000000..a3d545ca
+--- /dev/null
++++ b/ErsatzTV.Core.Tests/FFmpeg/HlsSegmentBitrateTests.cs
+@@ -0,0 +1,65 @@
++using ErsatzTV.Core.FFmpeg;
++using NUnit.Framework;
++using Shouldly;
++
++namespace ErsatzTV.Core.Tests.FFmpeg;
++
++[TestFixture]
++public class HlsSegmentBitrateTests
++{
++    private const string Playlist =
++        "#EXTM3U\n" +
++        "#EXT-X-TARGETDURATION:4\n" +
++        "#EXTINF:4.000000,\n" +
++        "#EXT-X-PROGRAM-DATE-TIME:2026-11-22T18:00:00.000+0100\n" +
++        "live000001.ts\n" +
++        "#EXTINF:4.000000,\n" +
++        "live000002.ts\n" +
++        "#EXTINF:2.000000,\n" +
++        "live000003.ts\n" +
++        "#EXTINF:4.000000,\n" +
++        "live000004.ts\n" +
++        "#EXTINF:4.000000,\n" +
++        "live000005.ts\n";
++
++    private static readonly DateTimeOffset Start = new(2026, 11, 22, 17, 0, 0, TimeSpan.Zero);
++
++    // 1 MB per 4 seconds = 2,000 kbps; segment 1 belongs to the previous item, segment 5 is missing
++    private static (long Size, DateTimeOffset WrittenAt)? Stat(string segment) =>
++        segment switch
++        {
++            "live000001.ts" => (4_000_000, Start.AddSeconds(-1)),
++            "live000002.ts" => (1_000_000, Start.AddSeconds(1)),
++            "live000003.ts" => (500_000, Start.AddSeconds(2)),
++            "live000004.ts" => (2_000_000, Start.AddSeconds(3)),
++            _ => null
++        };
++
++    [Test]
++    public void Measures_Segments_Written_Since_Start()
++    {
++        (double? average, double? current) = HlsSegmentBitrate.Measure(Playlist, Stat, Start, null);
++
++        // 3.5 MB over 10 seconds
++        average.ShouldBe(2800);
++        current.ShouldBe(2800);
++    }
++
++    [Test]
++    public void Stops_At_Next_Item()
++    {
++        (double? average, _) = HlsSegmentBitrate.Measure(Playlist, Stat, Start, Start.AddSeconds(3));
++
++        // 1.5 MB over 6 seconds
++        average.ShouldBe(2000);
++    }
++
++    [Test]
++    public void No_Segments_Yet()
++    {
++        (double? average, double? current) = HlsSegmentBitrate.Measure(Playlist, Stat, Start.AddHours(1), null);
++
++        average.ShouldBeNull();
++        current.ShouldBeNull();
++    }
++}
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs b/ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs
+index c7b44aba..b5a670ed 100644
+--- a/ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs
++++ b/ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs
+@@ -13,6 +13,7 @@ public class NextProgressReportTests
+         "started_at=1767225600000\n" +
+         "output_start=1767225601000\n" +
+         "realtime=false\n" +
++        "frame_rate=24000/1001\n" +
+         "args=-hwaccel videotoolbox -i \"/media/My Movie.mkv\" -c:v h264_videotoolbox -f hls live.m3u8\n" +
+         "seq=3\n" +
+         "frame=250\n" +
+@@ -31,6 +32,7 @@ public void Should_Parse_Header_And_Progress()
+         report.StartedAt.ShouldBe(DateTimeOffset.FromUnixTimeMilliseconds(1767225600000));
+         report.OutputStart.ShouldBe(DateTimeOffset.FromUnixTimeMilliseconds(1767225601000));
+         report.IsRealtime.ShouldBeFalse();
++        report.FrameRate.ShouldBe("24000/1001");
+         report.Sequence.ShouldBe(3);
+         report.ProgressLines.ShouldBe(["frame=250", "fps=50.0", "drop_frames=0", "progress=continue"]);
+         report.IsEnded.ShouldBeFalse();
+@@ -43,12 +45,16 @@ public void Should_Parse_Header_And_Progress()
+     [Test]
+     public void Should_Detect_End_And_Missing_Pid()
+     {
+-        string contents = Report.Replace("pid=1234", "pid=").Replace("progress=continue", "progress=end");
++        string contents = Report
++            .Replace("pid=1234", "pid=")
++            .Replace("frame_rate=24000/1001", "frame_rate=")
++            .Replace("progress=continue", "progress=end");
+ 
+         NextProgressReport report = NextProgressReport.Parse(contents).IfNoneUnsafe(() => null);
+ 
+         report.ShouldNotBeNull();
+         report.ProcessId.ShouldBeNull();
++        report.FrameRate.ShouldBeNull();
+         report.IsEnded.ShouldBeTrue();
+     }
+ 
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs b/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
+index 400c79da..aa6d4935 100644
+--- a/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
++++ b/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
+@@ -25,6 +25,8 @@ public partial record FFmpegAccelerationInfo(
+ 
+     private static readonly string[] FilterOptions = ["-filter_complex", "-vf", "-filter:v"];
+ 
++    private static readonly string[] VideoCodecOptions = ["-c:v", "-vcodec", "-codec:v", "-c:v:0"];
++
+     public static readonly FFmpegAccelerationInfo Unknown =
+         new(null, null, false, null, false, false, null, [], false, null, null, null);
+ 
+@@ -46,28 +48,25 @@ public static FFmpegAccelerationInfo FromArguments(string arguments)
+         }
+ 
+         // global options and video input options both come before the first input, which is always the video
+-        string hwaccel = LastValue(tokens, "-hwaccel", 0, firstInput);
++        string hwaccel = LastValue(tokens, ["-hwaccel"], 0, firstInput);
+         if (hwaccel is "none")
+         {
+             hwaccel = null;
+         }
+ 
+-        string decoder = LastValue(tokens, "-c:v", 0, firstInput);
++        string decoder = LastValue(tokens, VideoCodecOptions, 0, firstInput);
+         bool isHardwareDecode = hwaccel is not null || IsHardwareCodec(decoder);
+ 
+         int outputStart = Math.Min(tokens.Count, lastInput + 2);
+-        string encoder = LastValue(tokens, "-c:v", outputStart, tokens.Count);
+-        bool isVideoCopy = encoder is "copy" || encoder is null && LastValue(tokens, "-c", outputStart, tokens.Count) is "copy";
++        string encoder = LastValue(tokens, VideoCodecOptions, outputStart, tokens.Count);
++        bool isVideoCopy = encoder is "copy" || encoder is null && LastValue(tokens, ["-c"], outputStart, tokens.Count) is "copy";
+         if (encoder is null && isVideoCopy)
+         {
+             encoder = "copy";
+         }
+ 
+-        string filters = string.Join(
+-            ';',
+-            FilterOptions
+-                .Map(option => LastValue(tokens, option, 0, tokens.Count))
+-                .Filter(f => f is not null));
++        // ErsatzTV Next adds a separate -filter_complex for extra audio tracks
++        string filters = string.Join(';', AllValues(tokens, FilterOptions));
+ 
+         var hardwareFilters = HardwareFilter().Matches(filters)
+             .Select(m => m.Value)
+@@ -91,12 +90,12 @@ public static FFmpegAccelerationInfo FromArguments(string arguments)
+             encoder,
+             IsHardwareCodec(encoder),
+             isVideoCopy,
+-            LastValue(tokens, "-r", outputStart, tokens.Count),
++            LastValue(tokens, ["-r"], outputStart, tokens.Count),
+             hardwareFilters,
+             filters.Contains("hwdownload", StringComparison.Ordinal),
+             outputWidth,
+             outputHeight,
+-            LastValue(tokens, "-b:v", outputStart, tokens.Count));
++            LastValue(tokens, ["-b:v"], outputStart, tokens.Count));
+     }
+ 
+     public static Option<double> ParseFrameRate(string frameRate)
+@@ -127,12 +126,12 @@ private static bool IsHardwareCodec(string codec) =>
+         !string.IsNullOrWhiteSpace(codec) &&
+         HardwareCodecSuffixes.Any(suffix => codec.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+ 
+-    private static string LastValue(List<string> tokens, string option, int start, int end)
++    private static string LastValue(List<string> tokens, string[] options, int start, int end)
+     {
+         string result = null;
+         for (int i = start; i < end - 1; i++)
+         {
+-            if (tokens[i] == option)
++            if (options.Contains(tokens[i]))
+             {
+                 result = tokens[i + 1];
+             }
+@@ -141,6 +140,20 @@ private static string LastValue(List<string> tokens, string option, int start, i
+         return result;
+     }
+ 
++    private static List<string> AllValues(List<string> tokens, string[] options)
++    {
++        var result = new List<string>();
++        for (var i = 0; i < tokens.Count - 1; i++)
++        {
++            if (options.Contains(tokens[i]))
++            {
++                result.Add(tokens[i + 1]);
++            }
++        }
++
++        return result;
++    }
++
+     private static List<string> Tokenize(string arguments)
+     {
+         var result = new List<string>();
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs b/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
+index 9f04631a..563c34e9 100644
+--- a/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
++++ b/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
+@@ -25,6 +25,8 @@ public partial class FFmpegProgress
+     private TimeSpan? _outTime;
+     private TimeSpan? _lastReportOutTime;
+     private long _lastReportTimestamp;
++    private long? _reportedAt;
++    private long? _lastReportedAt;
+     private int _reportCount;
+ 
+     public Option<double> Speed
+@@ -103,6 +105,10 @@ public void ParseLine(string line)
+                 case "out_time_us" when TryParseLong(value, out long outTimeUs) && outTimeUs >= 0:
+                     _outTime = TimeSpan.FromTicks(outTimeUs * 10);
+                     break;
++                // added by ErsatzTV Next, whose reports may be read well after they were written
++                case "reported_at" when TryParseLong(value, out long reportedAt):
++                    _reportedAt = reportedAt;
++                    break;
+                 case "progress":
+                     CompleteReport();
+                     break;
+@@ -167,7 +173,9 @@ private void CompleteReport()
+ 
+         if (_lastReportOutTime is { } lastOutTime && _lastReportTimestamp > 0)
+         {
+-            double wallSeconds = Stopwatch.GetElapsedTime(_lastReportTimestamp, now).TotalSeconds;
++            double wallSeconds = _reportedAt is { } reportedAt && _lastReportedAt is { } lastReportedAt
++                ? (reportedAt - lastReportedAt) / 1000.0
++                : Stopwatch.GetElapsedTime(_lastReportTimestamp, now).TotalSeconds;
+             if (wallSeconds < 0.25)
+             {
+                 return;
+@@ -191,6 +199,7 @@ private void CompleteReport()
+         _lastReportOutTime = outTime;
+         _lastReportTotalSize = _totalSize;
+         _lastReportTimestamp = now;
++        _lastReportedAt = _reportedAt;
+     }
+ 
+     private static bool TryParseDouble(string value, out double result) =>
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs b/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
+index 69b024a1..eaa423a6 100644
+--- a/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
++++ b/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
+@@ -26,14 +26,19 @@ public FFmpegTranscodeMonitor(
+         bool isSlug,
+         DateTimeOffset outputStart,
+         string arguments,
+-        DateTimeOffset? startedAt = null)
++        DateTimeOffset? startedAt = null,
++        string defaultOutputFrameRate = null)
+     {
+         _mediaItemId = mediaItemId.MatchUnsafe(id => (int?)id, () => null);
+         _isWorkingAhead = isWorkingAhead;
+         _isSlug = isSlug;
+         _outputStart = outputStart;
+         _startedAt = startedAt ?? DateTimeOffset.Now;
+-        Acceleration = FFmpegAccelerationInfo.FromArguments(arguments);
++
++        FFmpegAccelerationInfo acceleration = FFmpegAccelerationInfo.FromArguments(arguments);
++        Acceleration = acceleration.OutputFrameRate is null && defaultOutputFrameRate is not null
++            ? acceleration with { OutputFrameRate = defaultOutputFrameRate }
++            : acceleration;
+     }
+ 
+     public FFmpegProgress Progress => _progress;
+diff --git a/ErsatzTV.Core/FFmpeg/HlsSegmentBitrate.cs b/ErsatzTV.Core/FFmpeg/HlsSegmentBitrate.cs
+new file mode 100644
+index 00000000..8e1de4ce
+--- /dev/null
++++ b/ErsatzTV.Core/FFmpeg/HlsSegmentBitrate.cs
+@@ -0,0 +1,55 @@
++using System.Globalization;
++
++namespace ErsatzTV.Core.FFmpeg;
++
++// ffmpeg reports no size for the hls muxer, so measure the segments it wrote instead
++public static class HlsSegmentBitrate
++{
++    private const int CurrentSegmentCount = 3;
++
++    public static (double? AverageKbps, double? CurrentKbps) Measure(
++        string playlist,
++        Func<string, (long Size, DateTimeOffset WrittenAt)?> statSegment,
++        DateTimeOffset writtenFrom,
++        DateTimeOffset? writtenUntil)
++    {
++        var segments = new List<(long Size, double Duration)>();
++        double? pendingDuration = null;
++
++        foreach (string rawLine in playlist.Split('\n'))
++        {
++            string line = rawLine.Trim();
++            if (line.StartsWith("#EXTINF:", StringComparison.Ordinal))
++            {
++                string value = line["#EXTINF:".Length..].Split(',')[0];
++                pendingDuration = double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double d)
++                    ? d
++                    : null;
++                continue;
++            }
++
++            if (line.Length == 0 || line.StartsWith('#'))
++            {
++                continue;
++            }
++
++            if (pendingDuration is { } duration && duration > 0 &&
++                statSegment(line) is { } stat &&
++                stat.WrittenAt >= writtenFrom &&
++                (writtenUntil is null || stat.WrittenAt < writtenUntil))
++            {
++                segments.Add((stat.Size, duration));
++            }
++
++            pendingDuration = null;
++        }
++
++        return (Kbps(segments), Kbps(segments.TakeLast(CurrentSegmentCount).ToList()));
++    }
++
++    private static double? Kbps(List<(long Size, double Duration)> segments)
++    {
++        double seconds = segments.Sum(s => s.Duration);
++        return seconds > 0 ? segments.Sum(s => s.Size) * 8 / seconds / 1000 : null;
++    }
++}
+diff --git a/ErsatzTV.Core/FFmpeg/NextProgressReport.cs b/ErsatzTV.Core/FFmpeg/NextProgressReport.cs
+index 22e8f21b..428a29f9 100644
+--- a/ErsatzTV.Core/FFmpeg/NextProgressReport.cs
++++ b/ErsatzTV.Core/FFmpeg/NextProgressReport.cs
+@@ -9,6 +9,7 @@ public record NextProgressReport(
+     DateTimeOffset StartedAt,
+     DateTimeOffset OutputStart,
+     bool IsRealtime,
++    string FrameRate,
+     string Arguments,
+     long Sequence,
+     List<string> ProgressLines)
+@@ -68,6 +69,7 @@ public static Option<NextProgressReport> Parse(string contents)
+             DateTimeOffset.FromUnixTimeMilliseconds(startedAt),
+             DateTimeOffset.FromUnixTimeMilliseconds(outputStart),
+             header.TryGetValue("realtime", out string realtime) && realtime == "true",
++            header.TryGetValue("frame_rate", out string frameRate) && frameRate.Length > 0 ? frameRate : null,
+             header.GetValueOrDefault("args", string.Empty),
+             sequence,
+             progressLines);
+-- 
+2.54.0 (Apple Git-157)
+

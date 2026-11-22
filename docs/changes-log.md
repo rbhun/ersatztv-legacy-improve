@@ -3569,3 +3569,13 @@ start time and ffmpeg arguments, to `ffmpeg-progress.txt` in the channel folder.
 patch 0008 reads that file, so Next channels now show speed, dropped/duplicated frames,
 bitrate, resolution, frame rate, hardware decode/encode, CPU and buffer ahead of live.
 Both full series apply on `LEGACY_TAG` / `NEXT_TAG`, build, and pass their tests.
+
+## 2026-11-22 (5) — Performance page fixes for Next channels
+
+First live look at a Next channel (VAAPI profile) showed a blank buffer and bitrate, the encoder
+as "Software / unknown", no GPU filters, and a false 0.50x slowest speed. Next patch 0004 adds
+the output frame rate and each report's wall clock time to `ffmpeg-progress.txt`. Legacy patch
+0011 reads Next's `-vcodec` and every `-filter_complex` (Next adds one for extra audio), falls
+back to that frame rate when there is no `-r` (fixes the buffer), times speed by the report
+time instead of when the page read it, and measures bitrate from the HLS segment files, since
+ffmpeg reports no size for the hls muxer.
