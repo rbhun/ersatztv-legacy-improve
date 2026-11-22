@@ -23,4 +23,5 @@ UPDATE_AGENT_URL=http://host.docker.internal:8410
 
 # Selectable update sources for the Health Check UI.
 # id|Label|git-url|branch ; … (semicolon-separated)
-UPDATE_SOURCES=improvements|Improvements|https://github.com/rbhun/ersatztv-legacy-improve.git|main
+# MUST be quoted — the | characters are not shell pipes when quoted.
+UPDATE_SOURCES='improvements|Improvements|https://github.com/rbhun/ersatztv-legacy-improve.git|main'
