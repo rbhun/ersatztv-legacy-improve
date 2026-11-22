@@ -1,0 +1,386 @@
+From 40573d1034030c184a3b39724a9371e3f55e571e Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 14:05:05 +0100
+Subject: [PATCH] =?UTF-8?q?feat:=20add=20Skip=20End=20Credits=20controls?=
+ =?UTF-8?q?=20to=20Settings=20=E2=86=92=20Playout?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Global playout settings enable credit skip for all channels; per-channel
+overrides on the channel editor still win when set. Saving playout
+settings rebuilds playouts so the trim takes effect.
+
+Co-authored-by: rbhun <rbhun@users.noreply.github.com>
+---
+ .../Commands/UpdatePlayoutSettingsHandler.cs  | 30 ++++++++++++----
+ .../Configuration/PlayoutSettingsViewModel.cs |  2 ++
+ .../Queries/GetPlayoutSettingsHandler.cs      | 12 ++++++-
+ .../Extensions/MediaItemExtensionsTests.cs    | 20 +++++++++++
+ ErsatzTV.Core/Domain/ConfigElementKey.cs      |  2 ++
+ .../BlockScheduling/BlockPlayoutBuilder.cs    |  5 ++-
+ ErsatzTV.Core/Scheduling/EndCreditsTrim.cs    | 36 +++++++++++++++++--
+ .../Scheduling/Engine/ISchedulingEngine.cs    |  2 ++
+ .../Scheduling/Engine/SchedulingEngine.cs     | 13 +++++--
+ ErsatzTV.Core/Scheduling/PlayoutBuilder.cs    |  5 ++-
+ .../ScriptedPlayoutBuilder.cs                 |  2 ++
+ .../SequentialPlayoutBuilder.cs               |  5 ++-
+ ErsatzTV/Pages/ChannelEditor.razor            |  4 +--
+ ErsatzTV/Pages/Settings/PlayoutSettings.razor | 25 +++++++++++++
+ 14 files changed, 146 insertions(+), 17 deletions(-)
+
+diff --git a/ErsatzTV.Application/Configuration/Commands/UpdatePlayoutSettingsHandler.cs b/ErsatzTV.Application/Configuration/Commands/UpdatePlayoutSettingsHandler.cs
+index 65cd6a3f..18a5b321 100644
+--- a/ErsatzTV.Application/Configuration/Commands/UpdatePlayoutSettingsHandler.cs
++++ b/ErsatzTV.Application/Configuration/Commands/UpdatePlayoutSettingsHandler.cs
+@@ -58,6 +58,16 @@ await _configElementRepository.Upsert(
+             playoutSettings.ScriptedScheduleTimeoutSeconds,
+             cancellationToken);
+ 
++        await _configElementRepository.Upsert(
++            ConfigElementKey.PlayoutSkipEndCredits,
++            playoutSettings.SkipEndCredits,
++            cancellationToken);
++
++        await _configElementRepository.Upsert(
++            ConfigElementKey.PlayoutEndCreditsKeepSeconds,
++            playoutSettings.EndCreditsKeepSeconds,
++            cancellationToken);
++
+         // continue all playouts to proper number of days
+         List<Playout> playouts = await dbContext.Playouts
+             .Include(p => p.Channel)
+@@ -71,10 +81,18 @@ await _configElementRepository.Upsert(
+         return Unit.Default;
+     }
+ 
+-    private static Task<Validation<BaseError, Unit>> Validate(UpdatePlayoutSettings request) =>
+-        Optional(request.PlayoutSettings.DaysToBuild)
+-            .Where(days => days > 0)
+-            .Map(_ => Unit.Default)
+-            .ToValidation<BaseError>("Days to build must be greater than zero")
+-            .AsTask();
++    private static Task<Validation<BaseError, Unit>> Validate(UpdatePlayoutSettings request)
++    {
++        if (request.PlayoutSettings.DaysToBuild <= 0)
++        {
++            return Task.FromResult(Fail<BaseError, Unit>("Days to build must be greater than zero"));
++        }
++
++        if (request.PlayoutSettings.EndCreditsKeepSeconds is < 0 or > 3600)
++        {
++            return Task.FromResult(Fail<BaseError, Unit>("Keep end credits must be between 0 and 3600 seconds"));
++        }
++
++        return Task.FromResult(Success<BaseError, Unit>(Unit.Default));
++    }
+ }
+diff --git a/ErsatzTV.Application/Configuration/PlayoutSettingsViewModel.cs b/ErsatzTV.Application/Configuration/PlayoutSettingsViewModel.cs
+index ae3c562b..efbee8f6 100644
+--- a/ErsatzTV.Application/Configuration/PlayoutSettingsViewModel.cs
++++ b/ErsatzTV.Application/Configuration/PlayoutSettingsViewModel.cs
+@@ -5,4 +5,6 @@ public class PlayoutSettingsViewModel
+     public int DaysToBuild { get; set; }
+     public bool SkipMissingItems { get; set; }
+     public int ScriptedScheduleTimeoutSeconds { get; set; }
++    public bool SkipEndCredits { get; set; }
++    public int EndCreditsKeepSeconds { get; set; }
+ }
+diff --git a/ErsatzTV.Application/Configuration/Queries/GetPlayoutSettingsHandler.cs b/ErsatzTV.Application/Configuration/Queries/GetPlayoutSettingsHandler.cs
+index a4af36a5..62e1a10e 100644
+--- a/ErsatzTV.Application/Configuration/Queries/GetPlayoutSettingsHandler.cs
++++ b/ErsatzTV.Application/Configuration/Queries/GetPlayoutSettingsHandler.cs
+@@ -24,11 +24,21 @@ await _configElementRepository.GetValue<int>(
+                 ConfigElementKey.PlayoutScriptedScheduleTimeoutSeconds,
+                 cancellationToken);
+ 
++        Option<bool> skipEndCredits =
++            await _configElementRepository.GetValue<bool>(ConfigElementKey.PlayoutSkipEndCredits, cancellationToken);
++
++        Option<int> endCreditsKeepSeconds =
++            await _configElementRepository.GetValue<int>(
++                ConfigElementKey.PlayoutEndCreditsKeepSeconds,
++                cancellationToken);
++
+         return new PlayoutSettingsViewModel
+         {
+             DaysToBuild = await daysToBuild.IfNoneAsync(2),
+             SkipMissingItems = await skipMissingItems.IfNoneAsync(false),
+-            ScriptedScheduleTimeoutSeconds = await scriptedScheduleTimeoutSeconds.IfNoneAsync(30)
++            ScriptedScheduleTimeoutSeconds = await scriptedScheduleTimeoutSeconds.IfNoneAsync(30),
++            SkipEndCredits = await skipEndCredits.IfNoneAsync(false),
++            EndCreditsKeepSeconds = await endCreditsKeepSeconds.IfNoneAsync(0)
+         };
+     }
+ }
+diff --git a/ErsatzTV.Core.Tests/Extensions/MediaItemExtensionsTests.cs b/ErsatzTV.Core.Tests/Extensions/MediaItemExtensionsTests.cs
+index 9bca17a2..c14345f1 100644
+--- a/ErsatzTV.Core.Tests/Extensions/MediaItemExtensionsTests.cs
++++ b/ErsatzTV.Core.Tests/Extensions/MediaItemExtensionsTests.cs
+@@ -124,4 +124,24 @@ public void Trim_Should_Follow_Channel_Settings(bool skipEndCredits, int keepSec
+ 
+         ((int?)trim?.Keep.TotalSeconds).ShouldBe(expectedSeconds);
+     }
++
++    [Test]
++    public void Trim_Should_Use_Global_When_Channel_Does_Not_Override()
++    {
++        var channel = new Channel(Guid.Empty) { SkipEndCredits = false, EndCreditsKeepSeconds = 0 };
++
++        EndCreditsTrim trim = EndCreditsTrim.Resolve(channel, globalSkip: true, globalKeepSeconds: 90);
++
++        ((int?)trim?.Keep.TotalSeconds).ShouldBe(90);
++    }
++
++    [Test]
++    public void Trim_Should_Prefer_Channel_Override_Over_Global()
++    {
++        var channel = new Channel(Guid.Empty) { SkipEndCredits = true, EndCreditsKeepSeconds = 30 };
++
++        EndCreditsTrim trim = EndCreditsTrim.Resolve(channel, globalSkip: true, globalKeepSeconds: 90);
++
++        ((int?)trim?.Keep.TotalSeconds).ShouldBe(30);
++    }
+ }
+diff --git a/ErsatzTV.Core/Domain/ConfigElementKey.cs b/ErsatzTV.Core/Domain/ConfigElementKey.cs
+index c03289f5..c9f8d481 100644
+--- a/ErsatzTV.Core/Domain/ConfigElementKey.cs
++++ b/ErsatzTV.Core/Domain/ConfigElementKey.cs
+@@ -52,6 +52,8 @@ public class ConfigElementKey
+     public static ConfigElementKey LibraryRefreshInterval => new("scanner.library_refresh_interval");
+     public static ConfigElementKey PlayoutDaysToBuild => new("playout.days_to_build");
+     public static ConfigElementKey PlayoutSkipMissingItems => new("playout.skip_missing_items");
++    public static ConfigElementKey PlayoutSkipEndCredits => new("playout.skip_end_credits");
++    public static ConfigElementKey PlayoutEndCreditsKeepSeconds => new("playout.end_credits_keep_seconds");
+ 
+     public static ConfigElementKey TroubleshootingBlockPlayoutHistoryPageSize =>
+         new("pages.troubleshooting.block_playout_history.page_size");
+diff --git a/ErsatzTV.Core/Scheduling/BlockScheduling/BlockPlayoutBuilder.cs b/ErsatzTV.Core/Scheduling/BlockScheduling/BlockPlayoutBuilder.cs
+index 028303c8..d288d8f3 100644
+--- a/ErsatzTV.Core/Scheduling/BlockScheduling/BlockPlayoutBuilder.cs
++++ b/ErsatzTV.Core/Scheduling/BlockScheduling/BlockPlayoutBuilder.cs
+@@ -51,7 +51,10 @@ public virtual async Task<Either<BaseError, PlayoutBuildResult>> Build(
+             referenceData.Channel.Number,
+             referenceData.Channel.Name);
+ 
+-        EndCreditsTrim endCreditsTrim = EndCreditsTrim.ForChannel(referenceData.Channel);
++        EndCreditsTrim endCreditsTrim = await EndCreditsTrim.ResolveAsync(
++            referenceData.Channel,
++            configElementRepository,
++            cancellationToken);
+ 
+         List<PlaybackOrder> allowedPlaybackOrders =
+         [
+diff --git a/ErsatzTV.Core/Scheduling/EndCreditsTrim.cs b/ErsatzTV.Core/Scheduling/EndCreditsTrim.cs
+index ad51c89e..026bb43f 100644
+--- a/ErsatzTV.Core/Scheduling/EndCreditsTrim.cs
++++ b/ErsatzTV.Core/Scheduling/EndCreditsTrim.cs
+@@ -1,11 +1,41 @@
+ using ErsatzTV.Core.Domain;
++using ErsatzTV.Core.Interfaces.Repositories;
+ 
+ namespace ErsatzTV.Core.Scheduling;
+ 
+ public record EndCreditsTrim(TimeSpan Keep)
+ {
+     public static EndCreditsTrim ForChannel(Channel channel) =>
+-        channel.SkipEndCredits
+-            ? new EndCreditsTrim(TimeSpan.FromSeconds(Math.Max(0, channel.EndCreditsKeepSeconds)))
+-            : null;
++        Resolve(channel, globalSkip: false, globalKeepSeconds: 0);
++
++    public static EndCreditsTrim Resolve(Channel channel, bool globalSkip, int globalKeepSeconds)
++    {
++        if (channel is { SkipEndCredits: true })
++        {
++            return new EndCreditsTrim(TimeSpan.FromSeconds(Math.Max(0, channel.EndCreditsKeepSeconds)));
++        }
++
++        if (globalSkip)
++        {
++            return new EndCreditsTrim(TimeSpan.FromSeconds(Math.Max(0, globalKeepSeconds)));
++        }
++
++        return null;
++    }
++
++    public static async Task<EndCreditsTrim> ResolveAsync(
++        Channel channel,
++        IConfigElementRepository configElementRepository,
++        CancellationToken cancellationToken)
++    {
++        bool globalSkip = await configElementRepository
++            .GetValue<bool>(ConfigElementKey.PlayoutSkipEndCredits, cancellationToken)
++            .IfNoneAsync(false);
++
++        int globalKeepSeconds = await configElementRepository
++            .GetValue<int>(ConfigElementKey.PlayoutEndCreditsKeepSeconds, cancellationToken)
++            .IfNoneAsync(0);
++
++        return Resolve(channel, globalSkip, globalKeepSeconds);
++    }
+ }
+diff --git a/ErsatzTV.Core/Scheduling/Engine/ISchedulingEngine.cs b/ErsatzTV.Core/Scheduling/Engine/ISchedulingEngine.cs
+index b52ab146..426a1243 100644
+--- a/ErsatzTV.Core/Scheduling/Engine/ISchedulingEngine.cs
++++ b/ErsatzTV.Core/Scheduling/Engine/ISchedulingEngine.cs
+@@ -13,6 +13,8 @@ public interface ISchedulingEngine
+ 
+     ISchedulingEngine WithReferenceData(PlayoutReferenceData referenceData);
+ 
++    ISchedulingEngine WithEndCreditsTrim(EndCreditsTrim endCreditsTrim);
++
+     ISchedulingEngine BuildBetween(DateTimeOffset start, DateTimeOffset finish);
+ 
+     ISchedulingEngine RemoveBefore(DateTimeOffset removeBefore);
+diff --git a/ErsatzTV.Core/Scheduling/Engine/SchedulingEngine.cs b/ErsatzTV.Core/Scheduling/Engine/SchedulingEngine.cs
+index 97512b09..0ceb906d 100644
+--- a/ErsatzTV.Core/Scheduling/Engine/SchedulingEngine.cs
++++ b/ErsatzTV.Core/Scheduling/Engine/SchedulingEngine.cs
+@@ -30,6 +30,7 @@ public class SchedulingEngine(
+     private readonly Dictionary<string, ImmutableList<MediaItem>> _enumeratorMediaItems = new();
+     private readonly SchedulingEngineState _state = new(0);
+     private PlayoutReferenceData _referenceData;
++    private EndCreditsTrim _endCreditsTrim;
+ 
+     public ISchedulingEngine WithPlayoutId(int playoutId)
+     {
+@@ -55,6 +56,12 @@ public ISchedulingEngine WithReferenceData(PlayoutReferenceData referenceData)
+         return this;
+     }
+ 
++    public ISchedulingEngine WithEndCreditsTrim(EndCreditsTrim endCreditsTrim)
++    {
++        _endCreditsTrim = endCreditsTrim;
++        return this;
++    }
++
+     public ISchedulingEngine BuildBetween(DateTimeOffset start, DateTimeOffset finish)
+     {
+         _state.Start = start;
+@@ -1494,8 +1501,10 @@ protected static FillerKind GetFillerKind(Option<FillerKind> maybeFillerKind)
+     }
+ 
+     private EndCreditsTrim EndCreditsTrimFor(FillerKind fillerKind) =>
+-        fillerKind is FillerKind.None && _referenceData?.Channel is { } channel
+-            ? EndCreditsTrim.ForChannel(channel)
++        fillerKind is FillerKind.None
++            ? _endCreditsTrim ?? (_referenceData?.Channel is { } channel
++                ? EndCreditsTrim.ForChannel(channel)
++                : null)
+             : null;
+ 
+     private async Task<Option<GraphicsElement>> GetGraphicsElementByPath(
+diff --git a/ErsatzTV.Core/Scheduling/PlayoutBuilder.cs b/ErsatzTV.Core/Scheduling/PlayoutBuilder.cs
+index 30325c2d..1fcc678c 100644
+--- a/ErsatzTV.Core/Scheduling/PlayoutBuilder.cs
++++ b/ErsatzTV.Core/Scheduling/PlayoutBuilder.cs
+@@ -759,7 +759,10 @@ await GetMediaCollectionEnumerator(
+             startAnchor.NextGuideGroup,
+             currentTime)
+         {
+-            EndCreditsTrim = EndCreditsTrim.ForChannel(referenceData.Channel)
++            EndCreditsTrim = await EndCreditsTrim.ResolveAsync(
++                referenceData.Channel,
++                _configElementRepository,
++                cancellationToken)
+         };
+ 
+         var schedulerOne = new PlayoutModeSchedulerOne(_logger);
+diff --git a/ErsatzTV.Core/Scheduling/ScriptedScheduling/ScriptedPlayoutBuilder.cs b/ErsatzTV.Core/Scheduling/ScriptedScheduling/ScriptedPlayoutBuilder.cs
+index 36550fee..241e3a9f 100644
+--- a/ErsatzTV.Core/Scheduling/ScriptedScheduling/ScriptedPlayoutBuilder.cs
++++ b/ErsatzTV.Core/Scheduling/ScriptedScheduling/ScriptedPlayoutBuilder.cs
+@@ -76,6 +76,8 @@ public async Task<Either<BaseError, PlayoutBuildResult>> Build(
+             schedulingEngine.WithSeed(playout.Seed);
+             schedulingEngine.BuildBetween(start, finish);
+             schedulingEngine.WithReferenceData(referenceData);
++            schedulingEngine.WithEndCreditsTrim(
++                await EndCreditsTrim.ResolveAsync(referenceData.Channel, configElementRepository, cancellationToken));
+ 
+             schedulingEngine.RestoreOrReset(Optional(playout.Anchor));
+ 
+diff --git a/ErsatzTV.Core/Scheduling/YamlScheduling/SequentialPlayoutBuilder.cs b/ErsatzTV.Core/Scheduling/YamlScheduling/SequentialPlayoutBuilder.cs
+index fd96353f..a98698ed 100644
+--- a/ErsatzTV.Core/Scheduling/YamlScheduling/SequentialPlayoutBuilder.cs
++++ b/ErsatzTV.Core/Scheduling/YamlScheduling/SequentialPlayoutBuilder.cs
+@@ -119,7 +119,10 @@ public async Task<Either<BaseError, PlayoutBuildResult>> Build(
+         var context = new YamlPlayoutContext(playout, playoutDefinition, 1)
+         {
+             CurrentTime = start,
+-            EndCreditsTrim = EndCreditsTrim.ForChannel(referenceData.Channel)
++            EndCreditsTrim = await EndCreditsTrim.ResolveAsync(
++                referenceData.Channel,
++                configElementRepository,
++                cancellationToken)
+ 
+             // no need to init default value and throw off visited count
+             // InstructionIndex = 0
+diff --git a/ErsatzTV/Pages/ChannelEditor.razor b/ErsatzTV/Pages/ChannelEditor.razor
+index 664c18e1..cb634006 100644
+--- a/ErsatzTV/Pages/ChannelEditor.razor
++++ b/ErsatzTV/Pages/ChannelEditor.razor
+@@ -282,7 +282,7 @@ else
+     <MudCheckBox @bind-Value="_model.SkipEndCredits"
+                  For="@(() => _model.SkipEndCredits)"
+                  Dense="true"
+-                 Label="End programs where Plex detected final credits; takes effect on the next playout build"/>
++                 Label="Override Settings → Playout for this channel; end programs where Plex detected final credits"/>
+ </MudStack>
+ <MudStack Row="true" Breakpoint="Breakpoint.SmAndDown" Class="form-field-stack gap-md-8 mb-5">
+     <div class="d-flex">
+@@ -294,7 +294,7 @@ else
+                   Disabled="@(!_model.SkipEndCredits)"
+                   Adornment="Adornment.End"
+                   AdornmentText="seconds"
+-                  HelperText="How much of the final credits to play before cutting to the next item"/>
++                  HelperText="Channel override: how much of the final credits to play before cutting to the next item"/>
+ </MudStack>
+ <MudStack Row="true" Breakpoint="Breakpoint.SmAndDown" Class="form-field-stack gap-md-8 mb-5">
+     <div class="d-flex">
+diff --git a/ErsatzTV/Pages/Settings/PlayoutSettings.razor b/ErsatzTV/Pages/Settings/PlayoutSettings.razor
+index 4b90e386..913383c6 100644
+--- a/ErsatzTV/Pages/Settings/PlayoutSettings.razor
++++ b/ErsatzTV/Pages/Settings/PlayoutSettings.razor
+@@ -33,6 +33,28 @@
+                 </div>
+                 <MudTextField @bind-Value="_playoutSettings.ScriptedScheduleTimeoutSeconds" Validation="@(new Func<int, string>(ValidateScriptedScheduleTimeoutSeconds))" Required="true" RequiredError="Scripted schedule timeout is required!" Adornment="Adornment.End" AdornmentText="seconds"/>
+             </MudStack>
++            <MudStack Row="true" Breakpoint="Breakpoint.SmAndDown" Class="form-field-stack gap-md-8 mb-5">
++                <div class="d-flex">
++                    <MudText>Skip End Credits</MudText>
++                </div>
++                <MudCheckBox @bind-Value="_playoutSettings.SkipEndCredits" Dense="true">
++                    <MudText Typo="Typo.caption" Style="font-weight: normal">
++                        End programs where Plex detected final credits (applies to all channels; individual channels can still override under Channels). Takes effect on the next playout build.
++                    </MudText>
++                </MudCheckBox>
++            </MudStack>
++            <MudStack Row="true" Breakpoint="Breakpoint.SmAndDown" Class="form-field-stack gap-md-8 mb-5">
++                <div class="d-flex">
++                    <MudText>Keep End Credits</MudText>
++                </div>
++                <MudTextField T="int"
++                              @bind-Value="_playoutSettings.EndCreditsKeepSeconds"
++                              Validation="@(new Func<int, string>(ValidateEndCreditsKeepSeconds))"
++                              Disabled="@(!_playoutSettings.SkipEndCredits)"
++                              Adornment="Adornment.End"
++                              AdornmentText="seconds"
++                              HelperText="How much of the final credits to play before cutting to the next item"/>
++            </MudStack>
+         </MudContainer>
+     </div>
+ </MudForm>
+@@ -72,6 +94,9 @@
+ 
+     private static string ValidateScriptedScheduleTimeoutSeconds(int seconds) => seconds < 10 ? "Scripted schedule timeout seconds must be at least 10" : null;
+ 
++    private static string ValidateEndCreditsKeepSeconds(int seconds) =>
++        seconds is < 0 or > 3600 ? "Keep end credits must be between 0 and 3600 seconds" : null;
++
+     private async Task SavePlayoutSettings()
+     {
+         await _form.ValidateAsync();
+-- 
+2.54.0 (Apple Git-157)
+
