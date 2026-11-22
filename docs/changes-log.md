@@ -3537,3 +3537,10 @@ says 1:32:14 (and 153,197 frames, about 1:42), but the video ends at 1:30:33 at 
 packet, so the last ~1 min 40 s of the slot went to the fallback screen. s01e01 and s01e02
 read cleanly to their ends (1:43:09 and 1:43:08). User to replace or delete s01e03; optional
 follow-up is a length cap on the kids channels' cartoon sources.
+
+## 2026-11-22 — Deploy from GitHub with a local overlay
+
+Added `deploy/`: the ErsatzTV host pulls this public repo (and the public Legacy/Next forks),
+builds or pulls the fork image, then merges schedules through `/opt/ersatztv/local/` so personal
+overrides survive updates. `bootstrap.sh` wires `/opt/ersatztv-deploy` + `/opt/ersatztv/local`;
+`ersatztv-update` is the everyday entry point. No LAN addresses or tokens in the new files.

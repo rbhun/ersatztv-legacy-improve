@@ -1,0 +1,28 @@
+# Rendered by deploy/target/update.sh from /opt/ersatztv/local/env.
+# Do not edit the generated copy under /opt/ersatztv/docker-compose.yml by hand;
+# change local/env (or this template in the public repo) and re-run update.sh.
+services:
+  ersatztv:
+    image: ${ETV_IMAGE}
+    container_name: ersatztv
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "${ETV_PORT}:${ETV_PORT}"
+    volumes:
+      - type: bind
+        source: ${ETV_DIR}/config
+        target: /config
+      - type: bind
+        source: ${MEDIA_PATH}
+        target: ${MEDIA_PATH}
+        read_only: true
+        bind:
+          propagation: rslave
+    tmpfs:
+      - /transcode:size=${TMPFS_MB}m,mode=1777
+    restart: unless-stopped
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID}"

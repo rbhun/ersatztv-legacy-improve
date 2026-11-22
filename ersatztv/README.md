@@ -46,7 +46,17 @@ truth for these channels — edit the files, not the UI.
 
 ## Deploying
 
-Use the deploy script. It takes one argument, the SSH target:
+Preferred path on the ErsatzTV host: pull this public repo and apply the local overlay
+(see [`deploy/README.md`](../deploy/README.md)):
+
+```bash
+ersatztv-update --overlay
+```
+
+Site-specific schedule edits belong in `/opt/ersatztv/local/schedules/` so a git pull cannot
+overwrite them. Public defaults stay in this folder.
+
+From a laptop you can still push YAML over SSH:
 
 ```bash
 scripts/deploy_ersatztv.sh user@host

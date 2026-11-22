@@ -12,8 +12,10 @@ tokens, API keys or library file listings; use `plex.internal` or `<host>` place
 
 ## Layout
 
-- `ersatztv/*.yml`: the six sequential schedules, two stream selectors and graphics. They are
-  deployed to `/opt/ersatztv/config/sequential-schedules/` in the ErsatzTV container (LXC 230).
+- `ersatztv/*.yml`: the six sequential schedules, two stream selectors and graphics. Public
+  defaults. On the target they land under `/opt/ersatztv/config/` via `deploy/target/apply-overlay.sh`.
+- `deploy/`: GitHub-pull deploy. Target checkout is `/opt/ersatztv-deploy`. Personal data lives in
+  `/opt/ersatztv/local/` (never committed). See `deploy/README.md`.
 - `ersatztv/audit/`: library inventory snapshots that the checkers read. Local only (gitignored);
   regenerate with `scripts/plex_library_audit.py`.
 - `scripts/`: run them from this folder, because they use paths relative to it.
