@@ -1,0 +1,331 @@
+From 3d318d3267a5bc2c29bd9d43d8c70860a9bc5eee Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 20:39:28 +0100
+Subject: [PATCH] fix: mux subtitles with segment muxer and dvbsub
+
+The HLS muxer cannot put bitmap/DVB subtitle streams into MPEG-TS
+segments (it only accepts WebVTT sidecars), which made ffmpeg exit with
+EINVAL / SIGSEGV when Subtitle Track Languages was set. Mux mode now
+writes segments via `-f segment`, encodes PGS/DVD as dvbsub, copies
+native DVB, and falls back to burn when only text subtitles exist.
+---
+ CHANGELOG.md                                  |  4 +-
+ .../ersatztv-channel/src/channel_session.rs   |  4 +
+ crates/ffpipeline/src/output_format.rs        | 94 +++++++++++++------
+ crates/ffpipeline/src/pipeline.rs             | 41 ++++++--
+ crates/ffpipeline/src/probe.rs                |  2 +
+ crates/ffpipeline/tests/common/mod.rs         |  1 +
+ 6 files changed, 111 insertions(+), 35 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f0120ab..eb25144 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -13,10 +13,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ - Add `mux` subtitle mode and `normalization.subtitle.tracks` to `channel.json` to mux multiple subtitle tracks into the MPEG-TS stream instead of burning subtitles in (channel config schema `0.1.7`)
+   - Each entry sets a track's `language` and `title`; the first describes the primary track
+   - Fill the extra tracks per item with `tracks.extra_subtitle` in the playout (playout schema `0.0.10`); unfilled tracks reuse the primary subtitle stream
+-  - Subtitles are encoded as DVD subtitles, so text subtitle sources can't be muxed; DVD and DVB subtitles are copied
++  - Image subtitles (PGS/DVD) are encoded as DVB (`dvbsub`); native DVB is copied. Text sources fall back to burn.
++  - Mux mode writes segments with the `segment` muxer because the HLS muxer cannot put bitmap subtitles into `.ts` files
+ 
+ ### Fixed
+ - Fix decoding a second audio stream from a source whose primary audio track is downmixed 5.1 AC-3
++- Fix subtitle mux crashing ffmpeg (HLS rejected dvdsub / multiple subtitle tracks; use `segment` + `dvbsub`)
+ 
+ ## [0.2.7] - 2026-11-20
+ ### Fixed
+diff --git a/crates/ersatztv-channel/src/channel_session.rs b/crates/ersatztv-channel/src/channel_session.rs
+index ea6bece..b78178a 100644
+--- a/crates/ersatztv-channel/src/channel_session.rs
++++ b/crates/ersatztv-channel/src/channel_session.rs
+@@ -699,6 +699,9 @@ impl ChannelSession {
+                 playlist: self.output_file.clone(),
+                 segment_template: self.output_segment_template.clone(),
+                 troubleshoot,
++                // HLS muxer cannot carry bitmap/DVB subtitle streams in .ts segments
++                in_band_subtitles: subtitle_mode == SubtitleMode::Mux
++                    && !subtitle_tracks.is_empty(),
+             },
+             pts_offset: pts_duration.map(|duration| PtsOffset { duration }),
+             realtime,
+@@ -2374,6 +2377,7 @@ mod tests {
+                 playlist: String::from("ffmpeg.m3u8"),
+                 segment_template: String::from("live%06d.ts"),
+                 troubleshoot: false,
++                in_band_subtitles: false,
+             },
+             pts_offset: None,
+             realtime: false,
+diff --git a/crates/ffpipeline/src/output_format.rs b/crates/ffpipeline/src/output_format.rs
+index eb987cc..51781bd 100644
+--- a/crates/ffpipeline/src/output_format.rs
++++ b/crates/ffpipeline/src/output_format.rs
+@@ -15,6 +15,10 @@ pub enum OutputFormat {
+         playlist: String,
+         segment_template: String,
+         troubleshoot: bool,
++        /// When true, write MPEG-TS segments with the `segment` muxer so in-band
++        /// subtitle streams (DVB) stay inside the `.ts` files. The HLS muxer only
++        /// accepts WebVTT sidecars and rejects dvdsub/dvbsub / multiple subtitle tracks.
++        in_band_subtitles: bool,
+     },
+ }
+ 
+@@ -33,6 +37,7 @@ impl OutputFormat {
+                 playlist,
+                 segment_template,
+                 troubleshoot,
++                in_band_subtitles,
+             } => {
+                 if output_context.video_encoder != VideoEncoder::Copy {
+                     args.extend(args![
+@@ -45,39 +50,74 @@ impl OutputFormat {
+                     ]);
+                 }
+ 
+-                args.extend(args![
+-                    "-f",
+-                    "hls",
+-                    "-hls_time",
+-                    segment_seconds,
+-                    "-hls_list_size",
+-                    "0",
+-                    "-segment_list_flags",
+-                    "+live",
+-                    "-hls_segment_filename",
+-                    segment_template.to_owned(),
+-                    "-hls_segment_type",
+-                    "mpegts",
+-                ]);
++                if *in_band_subtitles {
++                    // HLS muxer cannot put bitmap subtitles into MPEG-TS segments.
++                    args.extend(args![
++                        "-f",
++                        "segment",
++                        "-segment_format",
++                        "mpegts",
++                        "-segment_time",
++                        segment_seconds,
++                        "-segment_list_size",
++                        "0",
++                        "-segment_list_flags",
++                        "+live",
++                        "-segment_list_type",
++                        "m3u8",
++                        "-segment_list",
++                        playlist.to_owned(),
++                    ]);
++
++                    match output_context.pts_offset {
++                        Some(pts_offset) if pts_offset.duration > Duration::ZERO => {}
++                        _ => args.extend(args![
++                            "-segment_format_options",
++                            "mpegts_flags=+initial_discontinuity",
++                        ]),
++                    }
++
++                    // keep append behaviour for continuous channel output
++                    if !*troubleshoot {
++                        args.extend(args!["-break_non_keyframes", "1"]);
++                    }
+ 
+-                if *troubleshoot {
+-                    args.extend(args!["-hls_flags", "append_list+independent_segments"]);
++                    args.extend(args![segment_template.to_owned()]);
+                 } else {
+                     args.extend(args![
+-                        "-hls_flags",
+-                        "program_date_time+omit_endlist+append_list+independent_segments"
++                        "-f",
++                        "hls",
++                        "-hls_time",
++                        segment_seconds,
++                        "-hls_list_size",
++                        "0",
++                        "-segment_list_flags",
++                        "+live",
++                        "-hls_segment_filename",
++                        segment_template.to_owned(),
++                        "-hls_segment_type",
++                        "mpegts",
+                     ]);
+-                }
+ 
+-                match output_context.pts_offset {
+-                    Some(pts_offset) if pts_offset.duration > Duration::ZERO => {}
+-                    _ => args.extend(args![
+-                        "-hls_segment_options",
+-                        "mpegts_flags=+initial_discontinuity",
+-                    ]),
+-                }
++                    if *troubleshoot {
++                        args.extend(args!["-hls_flags", "append_list+independent_segments"]);
++                    } else {
++                        args.extend(args![
++                            "-hls_flags",
++                            "program_date_time+omit_endlist+append_list+independent_segments"
++                        ]);
++                    }
+ 
+-                args.extend(args![playlist.to_owned()]);
++                    match output_context.pts_offset {
++                        Some(pts_offset) if pts_offset.duration > Duration::ZERO => {}
++                        _ => args.extend(args![
++                            "-hls_segment_options",
++                            "mpegts_flags=+initial_discontinuity",
++                        ]),
++                    }
++
++                    args.extend(args![playlist.to_owned()]);
++                }
+             }
+         }
+ 
+diff --git a/crates/ffpipeline/src/pipeline.rs b/crates/ffpipeline/src/pipeline.rs
+index 17eb244..44693ac 100644
+--- a/crates/ffpipeline/src/pipeline.rs
++++ b/crates/ffpipeline/src/pipeline.rs
+@@ -644,7 +644,8 @@ struct MuxSubtitleStream {
+     copy: bool,
+ }
+ 
+-const MPEGTS_SUBTITLE_CODECS: &[&str] = &["dvd_subtitle", "dvdsub", "dvb_subtitle", "dvbsub"];
++/// Codecs that can be copied into MPEG-TS. DVD/PGS must be re-encoded to DVB.
++const MPEGTS_COPY_SUBTITLE_CODECS: &[&str] = &["dvb_subtitle", "dvbsub"];
+ 
+ const EXTRA_AUDIO_SILENCE: &str = "anullsrc=channel_layout=stereo:sample_rate=48000";
+ 
+@@ -705,6 +706,14 @@ impl Pipeline {
+             .collect();
+ 
+         let mux_subtitles = mux_subtitles(&input_settings, &final_output_settings);
++        // Mux needs image (PGS/DVD/DVB) streams inside MPEG-TS; text cannot be
++        // encoded to dvbsub. Fall back to burn so the item still plays.
++        if mux_subtitles.is_none() && final_output_settings.subtitle_mode == SubtitleMode::Mux {
++            log::warn!(
++                "subtitle mux requested but no image subtitle streams are available; burning instead"
++            );
++            final_output_settings.subtitle_mode = SubtitleMode::Burn;
++        }
+ 
+         if let Some(accel) = &final_output_settings.accel
+             && accel
+@@ -2039,7 +2048,7 @@ impl Pipeline {
+ 
+         if let Some(mux) = &self.mux_subtitles {
+             for (n, stream) in mux.streams.iter().enumerate() {
+-                let codec = if stream.copy { "copy" } else { "dvdsub" };
++                let codec = if stream.copy { "copy" } else { "dvbsub" };
+                 result.extend(args![format!("-c:s:{n}"), codec]);
+             }
+         }
+@@ -2123,6 +2132,7 @@ fn unknown_pgs_canvas_size(stream: &ProbeResultVideoStream) -> Option<FrameSize>
+ 
+ /// One stream per output subtitle track. The primary track is the item's selected subtitle;
+ /// each further track reads its `extra_subtitle_indices` entry, or reuses the primary.
++/// Only image subtitles (PGS/DVD/DVB) are muxed; text sources return `None`.
+ fn mux_subtitles(
+     input_settings: &InputSettings,
+     output_settings: &OutputSettings,
+@@ -2135,10 +2145,16 @@ fn mux_subtitles(
+ 
+     let input = input_settings.subtitle_input.as_ref()?;
+     let primary = input_settings.select_subtitle_stream()?;
++    if !primary.is_subtitle_image() {
++        return None;
++    }
++
+     let subtitle_stream = |index: u32| {
+         input.probe_result.streams.iter().find_map(|s| match s {
+             ProbeResultStream::Video(v)
+-                if v.codec_type == CodecType::Subtitle && v.stream_index == index =>
++                if v.codec_type == CodecType::Subtitle
++                    && v.stream_index == index
++                    && v.is_subtitle_image() =>
+             {
+                 Some(&**v)
+             }
+@@ -2157,7 +2173,7 @@ fn mux_subtitles(
+                 .unwrap_or(primary);
+             MuxSubtitleStream {
+                 index: stream.stream_index,
+-                copy: MPEGTS_SUBTITLE_CODECS.contains(&stream.codec.as_str()),
++                copy: MPEGTS_COPY_SUBTITLE_CODECS.contains(&stream.codec.as_str()),
+             }
+         })
+         .collect();
+@@ -2417,6 +2433,7 @@ mod tests {
+                 playlist: "out.m3u8".to_owned(),
+                 segment_template: "live%06d.ts".to_owned(),
+                 troubleshoot: false,
++                in_band_subtitles: false,
+             },
+             pts_offset: None,
+             realtime: false,
+@@ -3952,6 +3969,10 @@ mod tests {
+                 title: Some(language.to_uppercase()),
+             })
+             .collect();
++        let crate::output_format::OutputFormat::Hls {
++            in_band_subtitles, ..
++        } = &mut output.format;
++        *in_band_subtitles = true;
+         output
+     }
+ 
+@@ -3986,10 +4007,10 @@ mod tests {
+             2,
+             "{args:?}"
+         );
+-        // PGS is encoded; DVB is copied
+-        assert!(pairs.contains(&("-c:s:0".to_owned(), "dvdsub".to_owned())));
++        // PGS is encoded to DVB; native DVB is copied
++        assert!(pairs.contains(&("-c:s:0".to_owned(), "dvbsub".to_owned())));
+         assert!(pairs.contains(&("-c:s:1".to_owned(), "copy".to_owned())));
+-        assert!(pairs.contains(&("-c:s:2".to_owned(), "dvdsub".to_owned())));
++        assert!(pairs.contains(&("-c:s:2".to_owned(), "dvbsub".to_owned())));
+         for (n, language) in ["eng", "spa", "fre"].iter().enumerate() {
+             assert!(
+                 pairs.contains(&(format!("-metadata:s:s:{n}"), format!("language={language}")))
+@@ -4006,6 +4027,12 @@ mod tests {
+                 .any(|a| a.contains("overlay") || a.contains("subtitles=")),
+             "{args:?}"
+         );
++        // in-band subtitles use the segment muxer (HLS cannot carry DVB in .ts)
++        assert!(pairs.contains(&("-f".to_owned(), "segment".to_owned())), "{args:?}");
++        assert!(
++            pairs.contains(&("-segment_format".to_owned(), "mpegts".to_owned())),
++            "{args:?}"
++        );
+         let format = args.iter().rposition(|a| a == "-f").unwrap();
+         let last_metadata = args
+             .iter()
+diff --git a/crates/ffpipeline/src/probe.rs b/crates/ffpipeline/src/probe.rs
+index 8603840..5a0a065 100644
+--- a/crates/ffpipeline/src/probe.rs
++++ b/crates/ffpipeline/src/probe.rs
+@@ -27,6 +27,8 @@ static SUBTITLE_IMAGE_CODECS: &[&str] = &[
+     "vobsub",
+     "pgssub",
+     "pgs",
++    "dvb_subtitle",
++    "dvbsub",
+ ];
+ 
+ static STILL_IMAGE_CODECS: &[&str] = &["png", "mjpeg", "bmp", "tiff"];
+diff --git a/crates/ffpipeline/tests/common/mod.rs b/crates/ffpipeline/tests/common/mod.rs
+index 7b959f0..4d701aa 100644
+--- a/crates/ffpipeline/tests/common/mod.rs
++++ b/crates/ffpipeline/tests/common/mod.rs
+@@ -1476,6 +1476,7 @@ pub fn build_output(dir: &Path, params: TestOutputParams) -> OutputSettings {
+             playlist: dir.join("live.m3u8").to_string_lossy().into_owned(),
+             segment_template: dir.join("segment_%03d.ts").to_string_lossy().into_owned(),
+             troubleshoot: false,
++            in_band_subtitles: false,
+         },
+         pts_offset: None,
+         realtime: false,
+-- 
+2.54.0 (Apple Git-157)
+

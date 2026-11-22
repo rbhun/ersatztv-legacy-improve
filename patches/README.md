@@ -7,7 +7,7 @@ compiles — so this public repo does not need to vendor the full ErsatzTV / Nex
 | Directory | Upstream | Current series |
 |---|---|---|
 | `legacy/` | [ErsatzTV/ErsatzTV](https://github.com/ErsatzTV/ErsatzTV) @ `LEGACY_TAG` | multi-audio, credit skip (+ Settings→Playout UI), Health Check update panel, performance page (+ underrun log), Next performance, multi-subtitle mux, subtitle migration fix, subtitle migration fix |
-| `next/` | [ErsatzTV/next](https://github.com/ErsatzTV/next) @ `NEXT_TAG` | multi-audio tracks, ffmpeg progress, multi-subtitle mux, subtitle migration fix |
+| `next/` | [ErsatzTV/next](https://github.com/ErsatzTV/next) @ `NEXT_TAG` | multi-audio tracks, ffmpeg progress, multi-subtitle mux (+ segment/dvbsub fix), subtitle migration fix |
 
 When offering something upstream, open a PR against the real project from a throwaway branch;
 keep the patch here until it lands (then drop it on the next rebase).
