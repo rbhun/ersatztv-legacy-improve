@@ -3559,3 +3559,13 @@ Added `deploy/target/update-agent.py` and a systemd unit so the ErsatzTV Health 
 page can poll for updates every 10s, select a configured repo/branch, and trigger
 `update.sh`. Updates backup and restore `/opt/ersatztv/local` (and re-apply the overlay)
 so personal schedules/env survive. New legacy patch 0003 adds the UI client.
+
+## 2026-11-22 (4) — Performance page statistics for Next channels
+
+The System → Performance page showed "not available" for every channel, because they all
+stream through the Next engine, which runs ffmpeg itself. New next patch 0002 runs ffmpeg
+with `-progress pipe:1` and writes the latest report, with the item id, ffmpeg pid, output
+start time and ffmpeg arguments, to `ffmpeg-progress.txt` in the channel folder. New legacy
+patch 0008 reads that file, so Next channels now show speed, dropped/duplicated frames,
+bitrate, resolution, frame rate, hardware decode/encode, CPU and buffer ahead of live.
+Both full series apply on `LEGACY_TAG` / `NEXT_TAG`, build, and pass their tests.

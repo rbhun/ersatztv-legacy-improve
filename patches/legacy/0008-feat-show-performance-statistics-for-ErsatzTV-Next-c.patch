@@ -1,0 +1,478 @@
+From 6772cac0e69419c7739e3160012d2629ac5bef02 Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 17:41:16 +0100
+Subject: [PATCH] feat: show performance statistics for ErsatzTV Next channels
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+Co-authored-by: rbhun <rbhun@users.noreply.github.com>
+---
+ CHANGELOG.md                                  |   1 +
+ .../Queries/GetMediaItemIdByPlayoutItemId.cs  |   3 +
+ .../GetMediaItemIdByPlayoutItemIdHandler.cs   |  19 ++
+ .../Streaming/NextSessionWorker.cs            | 188 +++++++++++++++++-
+ .../FFmpeg/NextProgressReportTests.cs         |  61 ++++++
+ .../FFmpeg/FFmpegTranscodeMonitor.cs          |   5 +-
+ ErsatzTV.Core/FFmpeg/NextProgressReport.cs    |  82 ++++++++
+ ErsatzTV/Pages/Performance.razor              |   2 +-
+ 8 files changed, 356 insertions(+), 5 deletions(-)
+ create mode 100644 ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemId.cs
+ create mode 100644 ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemIdHandler.cs
+ create mode 100644 ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs
+ create mode 100644 ErsatzTV.Core/FFmpeg/NextProgressReport.cs
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9170f444..733b7eb1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+   - Dropped and duplicated frames reported by ffmpeg, with a note when source and output frame rates differ
+   - Whether video decode and encode are actually using hardware acceleration, including GPU filters and software fallbacks
+   - History of recent items per channel
++  - Channels using the ErsatzTV Next engine are included when the Next channel binary publishes ffmpeg progress
+ 
+ ## [26.13.0] - 2026-11-20
+ ### Changed
+diff --git a/ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemId.cs b/ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemId.cs
+new file mode 100644
+index 00000000..2c7311e0
+--- /dev/null
++++ b/ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemId.cs
+@@ -0,0 +1,3 @@
++namespace ErsatzTV.Application.Playouts;
++
++public record GetMediaItemIdByPlayoutItemId(int PlayoutItemId) : IRequest<Option<int>>;
+diff --git a/ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemIdHandler.cs b/ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemIdHandler.cs
+new file mode 100644
+index 00000000..07cfdc16
+--- /dev/null
++++ b/ErsatzTV.Application/Playouts/Queries/GetMediaItemIdByPlayoutItemIdHandler.cs
+@@ -0,0 +1,19 @@
++using ErsatzTV.Infrastructure.Data;
++using Microsoft.EntityFrameworkCore;
++
++namespace ErsatzTV.Application.Playouts;
++
++public class GetMediaItemIdByPlayoutItemIdHandler(IDbContextFactory<TvContext> dbContextFactory)
++    : IRequestHandler<GetMediaItemIdByPlayoutItemId, Option<int>>
++{
++    public async Task<Option<int>> Handle(GetMediaItemIdByPlayoutItemId request, CancellationToken cancellationToken)
++    {
++        await using TvContext dbContext = await dbContextFactory.CreateDbContextAsync(cancellationToken);
++        return await dbContext.PlayoutItems
++            .AsNoTracking()
++            .Filter(pi => pi.Id == request.PlayoutItemId)
++            .Map(pi => pi.MediaItemId)
++            .ToListAsync(cancellationToken)
++            .Map(list => list.HeadOrNone());
++    }
++}
+diff --git a/ErsatzTV.Application/Streaming/NextSessionWorker.cs b/ErsatzTV.Application/Streaming/NextSessionWorker.cs
+index d3449db1..c8930501 100644
+--- a/ErsatzTV.Application/Streaming/NextSessionWorker.cs
++++ b/ErsatzTV.Application/Streaming/NextSessionWorker.cs
+@@ -1,3 +1,5 @@
++using System.Collections.Concurrent;
++using System.Globalization;
+ using System.IO.Abstractions;
+ using CliWrap;
+ using ErsatzTV.Application.Playouts;
+@@ -21,7 +23,13 @@ public class NextSessionWorker(
+     ILogger<NextSessionWorker> logger)
+     : IHlsSessionWorker
+ {
++    private const int MaxPerformanceHistory = 25;
++
+     private readonly TimeSpan _checkpointThreshold = TimeSpan.FromMinutes(5);
++    private readonly Lock _performanceSync = new();
++    private readonly LinkedList<(string ItemId, FFmpegTranscodePerformance Performance)> _performanceHistory = [];
++    private readonly ConcurrentDictionary<string, int?> _mediaItemIds = new(StringComparer.Ordinal);
++    private NextTranscode _currentTranscode;
+ 
+     private readonly SemaphoreSlim _slim = new(1, 1);
+     private CancellationTokenSource _cancellationTokenSource;
+@@ -49,6 +57,11 @@ protected virtual void Dispose(bool disposing)
+         {
+             if (disposing)
+             {
++                lock (_performanceSync)
++                {
++                    _currentTranscode?.Monitor.Dispose();
++                }
++
+                 _serviceScope.Dispose();
+                 _serviceScope = null;
+             }
+@@ -104,8 +117,179 @@ public void PlayoutUpdated()
+ 
+     public HlsSessionModel GetModel() => new(_channelNumber, "next", null, _lastTouch, _sessionStart);
+ 
+-    public HlsSessionPerformanceModel GetPerformance() =>
+-        HlsSessionPerformanceModel.NotSupported(_channelNumber, "next", _sessionStart);
++    public HlsSessionPerformanceModel GetPerformance()
++    {
++        lock (_performanceSync)
++        {
++            RefreshTranscode();
++
++            if (_currentTranscode is null && _performanceHistory.Count == 0)
++            {
++                return HlsSessionPerformanceModel.NotSupported(_channelNumber, "next", _sessionStart);
++            }
++
++            FFmpegTranscodePerformance current = null;
++            double? bufferSeconds = null;
++            if (_currentTranscode is not null)
++            {
++                current = WithMediaItem(_currentTranscode.ItemId, _currentTranscode.Monitor.GetPerformance());
++                foreach (DateTimeOffset until in _currentTranscode.Monitor.TranscodedUntil)
++                {
++                    bufferSeconds = (until - DateTimeOffset.Now).TotalSeconds;
++                }
++            }
++
++            return new HlsSessionPerformanceModel(
++                _channelNumber,
++                "next",
++                true,
++                _sessionStart,
++                bufferSeconds,
++                current,
++                _performanceHistory.Map(h => WithMediaItem(h.ItemId, h.Performance)).ToList());
++        }
++    }
++
++    private void RefreshTranscode()
++    {
++        if (string.IsNullOrWhiteSpace(_workingDirectory))
++        {
++            return;
++        }
++
++        string contents;
++        try
++        {
++            contents = fileSystem.File.ReadAllText(
++                fileSystem.Path.Combine(_workingDirectory, NextProgressReport.FileName));
++        }
++        catch (Exception)
++        {
++            // not published yet, or replaced while reading
++            return;
++        }
++
++        foreach (NextProgressReport report in NextProgressReport.Parse(contents))
++        {
++            if (_currentTranscode is null
++                || _currentTranscode.ItemId != report.ItemId
++                || _currentTranscode.StartedAt != report.StartedAt)
++            {
++                if (_currentTranscode is not null)
++                {
++                    FinishTranscode(_currentTranscode, succeeded: null);
++                }
++
++                var monitor = new FFmpegTranscodeMonitor(
++                    None,
++                    !report.IsRealtime,
++                    false,
++                    report.OutputStart,
++                    report.Arguments,
++                    report.StartedAt);
++                if (report.ProcessId is { } processId)
++                {
++                    monitor.AttachProcess(processId);
++                }
++
++                _currentTranscode = new NextTranscode(report.ItemId, report.StartedAt, monitor);
++                ResolveMediaItemId(report.ItemId);
++            }
++
++            if (report.Sequence > _currentTranscode.Sequence)
++            {
++                _currentTranscode.Sequence = report.Sequence;
++                foreach (string line in report.ProgressLines)
++                {
++                    _currentTranscode.Monitor.ParseLine(line);
++                }
++
++                if (report.IsEnded && !_currentTranscode.IsEnded)
++                {
++                    _currentTranscode.IsEnded = true;
++                    _currentTranscode.Monitor.Complete(true);
++                }
++            }
++        }
++    }
++
++    private void FinishTranscode(NextTranscode transcode, bool? succeeded)
++    {
++        if (!transcode.IsEnded)
++        {
++            transcode.Monitor.Complete(succeeded);
++        }
++
++        transcode.Monitor.Dispose();
++        _performanceHistory.AddFirst((transcode.ItemId, transcode.Monitor.GetPerformance()));
++        while (_performanceHistory.Count > MaxPerformanceHistory)
++        {
++            _performanceHistory.RemoveLast();
++        }
++    }
++
++    private FFmpegTranscodePerformance WithMediaItem(string itemId, FFmpegTranscodePerformance performance) =>
++        _mediaItemIds.TryGetValue(itemId, out int? mediaItemId) && mediaItemId is not null
++            ? performance with { MediaItemId = mediaItemId }
++            : performance;
++
++    private void ResolveMediaItemId(string itemId)
++    {
++        if (_mediaItemIds.Count > MaxPerformanceHistory * 4)
++        {
++            _mediaItemIds.Clear();
++        }
++
++        if (!_mediaItemIds.TryAdd(itemId, null))
++        {
++            return;
++        }
++
++        // unsaved-{start}-{mediaItemId}, e.g. fallback filler
++        if (itemId.StartsWith("unsaved-", StringComparison.Ordinal))
++        {
++            if (int.TryParse(
++                    itemId[(itemId.LastIndexOf('-') + 1)..],
++                    NumberStyles.None,
++                    CultureInfo.InvariantCulture,
++                    out int unsavedMediaItemId))
++            {
++                _mediaItemIds[itemId] = unsavedMediaItemId;
++            }
++
++            return;
++        }
++
++        if (!int.TryParse(itemId, NumberStyles.None, CultureInfo.InvariantCulture, out int playoutItemId))
++        {
++            return;
++        }
++
++        IMediator mediator = Mediator;
++        _ = Task.Run(async () =>
++        {
++            try
++            {
++                foreach (int mediaItemId in await mediator.Send(new GetMediaItemIdByPlayoutItemId(playoutItemId)))
++                {
++                    _mediaItemIds[itemId] = mediaItemId;
++                }
++            }
++            catch (Exception ex)
++            {
++                logger.LogDebug(ex, "Failed to find media item for playout item {PlayoutItemId}", playoutItemId);
++            }
++        });
++    }
++
++    private sealed class NextTranscode(string itemId, DateTimeOffset startedAt, FFmpegTranscodeMonitor monitor)
++    {
++        public string ItemId { get; } = itemId;
++        public DateTimeOffset StartedAt { get; } = startedAt;
++        public FFmpegTranscodeMonitor Monitor { get; } = monitor;
++        public long Sequence { get; set; }
++        public bool IsEnded { get; set; }
++    }
+ 
+     public async Task Run(
+         string channelNumber,
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs b/ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs
+new file mode 100644
+index 00000000..c7b44aba
+--- /dev/null
++++ b/ErsatzTV.Core.Tests/FFmpeg/NextProgressReportTests.cs
+@@ -0,0 +1,61 @@
++using ErsatzTV.Core.FFmpeg;
++using NUnit.Framework;
++using Shouldly;
++
++namespace ErsatzTV.Core.Tests.FFmpeg;
++
++[TestFixture]
++public class NextProgressReportTests
++{
++    private const string Report =
++        "item_id=42\n" +
++        "pid=1234\n" +
++        "started_at=1767225600000\n" +
++        "output_start=1767225601000\n" +
++        "realtime=false\n" +
++        "args=-hwaccel videotoolbox -i \"/media/My Movie.mkv\" -c:v h264_videotoolbox -f hls live.m3u8\n" +
++        "seq=3\n" +
++        "frame=250\n" +
++        "fps=50.0\n" +
++        "drop_frames=0\n" +
++        "progress=continue\n";
++
++    [Test]
++    public void Should_Parse_Header_And_Progress()
++    {
++        NextProgressReport report = NextProgressReport.Parse(Report).IfNoneUnsafe(() => null);
++
++        report.ShouldNotBeNull();
++        report.ItemId.ShouldBe("42");
++        report.ProcessId.ShouldBe(1234);
++        report.StartedAt.ShouldBe(DateTimeOffset.FromUnixTimeMilliseconds(1767225600000));
++        report.OutputStart.ShouldBe(DateTimeOffset.FromUnixTimeMilliseconds(1767225601000));
++        report.IsRealtime.ShouldBeFalse();
++        report.Sequence.ShouldBe(3);
++        report.ProgressLines.ShouldBe(["frame=250", "fps=50.0", "drop_frames=0", "progress=continue"]);
++        report.IsEnded.ShouldBeFalse();
++
++        FFmpegAccelerationInfo info = FFmpegAccelerationInfo.FromArguments(report.Arguments);
++        info.IsHardwareDecode.ShouldBeTrue();
++        info.IsHardwareEncode.ShouldBeTrue();
++    }
++
++    [Test]
++    public void Should_Detect_End_And_Missing_Pid()
++    {
++        string contents = Report.Replace("pid=1234", "pid=").Replace("progress=continue", "progress=end");
++
++        NextProgressReport report = NextProgressReport.Parse(contents).IfNoneUnsafe(() => null);
++
++        report.ShouldNotBeNull();
++        report.ProcessId.ShouldBeNull();
++        report.IsEnded.ShouldBeTrue();
++    }
++
++    [Test]
++    public void Should_Reject_Incomplete_Report()
++    {
++        NextProgressReport.Parse("item_id=42\npid=1\n").IsNone.ShouldBeTrue();
++        NextProgressReport.Parse(string.Empty).IsNone.ShouldBeTrue();
++    }
++}
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs b/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
+index f1bc2abe..69b024a1 100644
+--- a/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
++++ b/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
+@@ -25,13 +25,14 @@ public FFmpegTranscodeMonitor(
+         bool isWorkingAhead,
+         bool isSlug,
+         DateTimeOffset outputStart,
+-        string arguments)
++        string arguments,
++        DateTimeOffset? startedAt = null)
+     {
+         _mediaItemId = mediaItemId.MatchUnsafe(id => (int?)id, () => null);
+         _isWorkingAhead = isWorkingAhead;
+         _isSlug = isSlug;
+         _outputStart = outputStart;
+-        _startedAt = DateTimeOffset.Now;
++        _startedAt = startedAt ?? DateTimeOffset.Now;
+         Acceleration = FFmpegAccelerationInfo.FromArguments(arguments);
+     }
+ 
+diff --git a/ErsatzTV.Core/FFmpeg/NextProgressReport.cs b/ErsatzTV.Core/FFmpeg/NextProgressReport.cs
+new file mode 100644
+index 00000000..22e8f21b
+--- /dev/null
++++ b/ErsatzTV.Core/FFmpeg/NextProgressReport.cs
+@@ -0,0 +1,82 @@
++using System.Globalization;
++
++namespace ErsatzTV.Core.FFmpeg;
++
++// latest ffmpeg -progress report published by the ErsatzTV Next channel binary
++public record NextProgressReport(
++    string ItemId,
++    int? ProcessId,
++    DateTimeOffset StartedAt,
++    DateTimeOffset OutputStart,
++    bool IsRealtime,
++    string Arguments,
++    long Sequence,
++    List<string> ProgressLines)
++{
++    public const string FileName = "ffmpeg-progress.txt";
++
++    public bool IsEnded => ProgressLines.Contains("progress=end");
++
++    public static Option<NextProgressReport> Parse(string contents)
++    {
++        if (string.IsNullOrWhiteSpace(contents))
++        {
++            return None;
++        }
++
++        var header = new Dictionary<string, string>(StringComparer.Ordinal);
++        var progressLines = new List<string>();
++        var inProgress = false;
++
++        foreach (string line in contents.Split('\n'))
++        {
++            string trimmed = line.TrimEnd('\r');
++            if (inProgress)
++            {
++                if (trimmed.Length > 0)
++                {
++                    progressLines.Add(trimmed);
++                }
++
++                continue;
++            }
++
++            int separator = trimmed.IndexOf('=', StringComparison.Ordinal);
++            if (separator <= 0)
++            {
++                continue;
++            }
++
++            string key = trimmed[..separator];
++            header[key] = trimmed[(separator + 1)..];
++            inProgress = key == "seq";
++        }
++
++        if (!header.TryGetValue("item_id", out string itemId)
++            || !TryGetLong(header, "seq", out long sequence)
++            || !TryGetLong(header, "started_at", out long startedAt)
++            || !TryGetLong(header, "output_start", out long outputStart))
++        {
++            return None;
++        }
++
++        int? processId = TryGetLong(header, "pid", out long pid) ? (int)pid : null;
++
++        return new NextProgressReport(
++            itemId,
++            processId,
++            DateTimeOffset.FromUnixTimeMilliseconds(startedAt),
++            DateTimeOffset.FromUnixTimeMilliseconds(outputStart),
++            header.TryGetValue("realtime", out string realtime) && realtime == "true",
++            header.GetValueOrDefault("args", string.Empty),
++            sequence,
++            progressLines);
++    }
++
++    private static bool TryGetLong(Dictionary<string, string> header, string key, out long value)
++    {
++        value = 0;
++        return header.TryGetValue(key, out string text)
++               && long.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value);
++    }
++}
+diff --git a/ErsatzTV/Pages/Performance.razor b/ErsatzTV/Pages/Performance.razor
+index 89dc71f4..694ea19a 100644
+--- a/ErsatzTV/Pages/Performance.razor
++++ b/ErsatzTV/Pages/Performance.razor
+@@ -53,7 +53,7 @@
+                     @if (!session.IsSupported)
+                     {
+                         <MudAlert Severity="Severity.Info" Dense="true">
+-                            Live statistics are not available for channels using the ErsatzTV Next streaming engine.
++                            Waiting for live statistics from the ErsatzTV Next streaming engine. These require a Next build that publishes ffmpeg progress.
+                         </MudAlert>
+                     }
+                     else
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,263 @@
+From 6753d213e33c61a3d30284e2f36a9daec67580f5 Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 17:41:45 +0100
+Subject: [PATCH] feat: publish ffmpeg progress for host statistics
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ .../ersatztv-channel/src/channel_session.rs   |  37 +++--
+ crates/ersatztv-channel/src/main.rs           |   1 +
+ .../ersatztv-channel/src/playlist_manager.rs  |   7 +-
+ crates/ersatztv-channel/src/progress.rs       | 143 ++++++++++++++++++
+ 4 files changed, 177 insertions(+), 11 deletions(-)
+ create mode 100644 crates/ersatztv-channel/src/progress.rs
+
+diff --git a/crates/ersatztv-channel/src/channel_session.rs b/crates/ersatztv-channel/src/channel_session.rs
+index fc4f49c..4a4b9e5 100644
+--- a/crates/ersatztv-channel/src/channel_session.rs
++++ b/crates/ersatztv-channel/src/channel_session.rs
+@@ -926,28 +926,45 @@ impl ChannelSession {
+             None => text.to_owned(),
+         };
+ 
+-        self.playlist_manager
+-            .lock()
+-            .await
+-            .before_new_pipeline(
+-                self.transcoded_until - self.start_time_offset,
+-                pts_offset,
+-                subtitle_source,
+-            )
+-            .await?;
++        let output_start = {
++            let mut playlist_manager = self.playlist_manager.lock().await;
++            playlist_manager
++                .before_new_pipeline(
++                    self.transcoded_until - self.start_time_offset,
++                    pts_offset,
++                    subtitle_source,
++                )
++                .await?;
++            playlist_manager.current_session_start()
++        };
+ 
+         // stream current item
+         let mut ffmpeg_child = ersatztv_core::process::command(&self.ffmpeg_path)
++            .args(crate::progress::PROGRESS_ARGS)
+             .args(args.iter().map(Cow::as_ref))
+             .envs(
+                 envs.iter()
+                     .map(|env| (env.key.as_str(), env.value.as_str())),
+             )
+-            .stdout(std::process::Stdio::null())
++            .stdout(std::process::Stdio::piped())
+             .stderr(std::process::Stdio::piped())
+             .spawn()
+             .map_err(|_| ChannelError::StreamFailure(String::from("failed to spawn ffmpeg")))?;
+ 
++        if let Some(stdout) = ffmpeg_child.stdout.take() {
++            crate::progress::spawn_progress_writer(
++                stdout,
++                self.channel_config.expanded_output_folder().to_owned(),
++                crate::progress::ProgressHeader {
++                    item_id: &current_item.id,
++                    pid: ffmpeg_child.id(),
++                    realtime,
++                    output_start,
++                    args: &args,
++                },
++            );
++        }
++
+         let stderr = ffmpeg_child
+             .stderr
+             .take()
+diff --git a/crates/ersatztv-channel/src/main.rs b/crates/ersatztv-channel/src/main.rs
+index a5de7cd..06415ee 100644
+--- a/crates/ersatztv-channel/src/main.rs
++++ b/crates/ersatztv-channel/src/main.rs
+@@ -5,6 +5,7 @@ mod local_proxy;
+ mod logging;
+ mod playlist_manager;
+ mod playout_loader;
++mod progress;
+ mod pts_scanner;
+ mod still_image;
+ 
+diff --git a/crates/ersatztv-channel/src/playlist_manager.rs b/crates/ersatztv-channel/src/playlist_manager.rs
+index c15b40e..ef9f586 100644
+--- a/crates/ersatztv-channel/src/playlist_manager.rs
++++ b/crates/ersatztv-channel/src/playlist_manager.rs
+@@ -193,6 +193,11 @@ impl PlaylistManager {
+         Ok(())
+     }
+ 
++    /// wall clock time that the current pipeline's first segment is published at
++    pub fn current_session_start(&self) -> OffsetDateTime {
++        self.current_session_start
++    }
++
+     pub async fn pipeline_output(&mut self) -> Result<time::Duration, ChannelError> {
+         self.update().await?;
+         Ok(self.last_segment_end - self.current_session_start)
+@@ -507,7 +512,7 @@ async fn remove_trimmed(path: &Path, operation: &'static str) -> Result<(), Chan
+     }
+ }
+ 
+-async fn write_atomic(
++pub(crate) async fn write_atomic(
+     folder: &Path,
+     dest: impl AsRef<Path>,
+     contents: impl AsRef<[u8]>,
+diff --git a/crates/ersatztv-channel/src/progress.rs b/crates/ersatztv-channel/src/progress.rs
+new file mode 100644
+index 0000000..a9dd053
+--- /dev/null
++++ b/crates/ersatztv-channel/src/progress.rs
+@@ -0,0 +1,143 @@
++use std::borrow::Cow;
++use std::path::PathBuf;
++
++use time::OffsetDateTime;
++use tokio::io::{AsyncBufReadExt, AsyncRead};
++use tokio::task::JoinHandle;
++use tracing::Instrument;
++
++use crate::playlist_manager::write_atomic;
++
++pub const PROGRESS_FILE_NAME: &str = "ffmpeg-progress.txt";
++
++pub const PROGRESS_ARGS: [&str; 2] = ["-progress", "pipe:1"];
++
++pub struct ProgressHeader<'a> {
++    pub item_id: &'a str,
++    pub pid: Option<u32>,
++    pub realtime: bool,
++    /// wall clock time of the first output frame
++    pub output_start: OffsetDateTime,
++    pub args: &'a [Cow<'a, str>],
++}
++
++/// Publishes each `-progress` report, prefixed with what the report belongs to, so the host
++/// can show live transcode statistics without parsing ffmpeg's log.
++pub fn spawn_progress_writer(
++    stdout: impl AsyncRead + Unpin + Send + 'static,
++    output_folder: PathBuf,
++    header: ProgressHeader<'_>,
++) -> JoinHandle<()> {
++    let header = header.render(OffsetDateTime::now_utc());
++    let dest = output_folder.join(PROGRESS_FILE_NAME);
++
++    tokio::spawn(
++        async move {
++            let mut lines = tokio::io::BufReader::new(stdout).lines();
++            let mut block = String::new();
++            let mut seq: u64 = 0;
++            while let Ok(Some(line)) = lines.next_line().await {
++                block.push_str(&line);
++                block.push('\n');
++                if line.starts_with("progress=") {
++                    seq += 1;
++                    let body = format!("{header}seq={seq}\n{block}");
++                    if let Err(e) = write_atomic(&output_folder, &dest, body).await {
++                        log::debug!("failed to write ffmpeg progress: {e}");
++                    }
++                    block.clear();
++                }
++            }
++        }
++        .in_current_span(),
++    )
++}
++
++impl ProgressHeader<'_> {
++    fn render(&self, started_at: OffsetDateTime) -> String {
++        let args = self
++            .args
++            .iter()
++            .map(|a| quote(a))
++            .collect::<Vec<_>>()
++            .join(" ");
++        format!(
++            "item_id={}\npid={}\nstarted_at={}\noutput_start={}\nrealtime={}\nargs={args}\n",
++            self.item_id.replace(['\n', '\r'], " "),
++            self.pid.map(|p| p.to_string()).unwrap_or_default(),
++            unix_ms(started_at),
++            unix_ms(self.output_start),
++            self.realtime,
++        )
++    }
++}
++
++fn unix_ms(time: OffsetDateTime) -> i128 {
++    time.unix_timestamp_nanos() / 1_000_000
++}
++
++fn quote(arg: &str) -> Cow<'_, str> {
++    if !arg.is_empty() && !arg.contains(|c: char| c.is_whitespace() || c == '"') {
++        return Cow::Borrowed(arg);
++    }
++
++    let escaped = arg.replace(['\n', '\r'], " ").replace('"', "\\\"");
++    Cow::Owned(format!("\"{escaped}\""))
++}
++
++#[cfg(test)]
++mod tests {
++    use time::macros::datetime;
++
++    use super::*;
++
++    #[test]
++    fn header_quotes_arguments_with_spaces() {
++        let args = [
++            Cow::Borrowed("-i"),
++            Cow::Borrowed("/media/My Movie.mkv"),
++            Cow::Borrowed("-vf"),
++            Cow::Borrowed("drawtext=text=\"hi\""),
++        ];
++        let header = ProgressHeader {
++            item_id: "42",
++            pid: Some(7),
++            realtime: true,
++            output_start: datetime!(2026-01-01 00:00:01 UTC),
++            args: &args,
++        };
++
++        let rendered = header.render(datetime!(2026-01-01 00:00:00 UTC));
++
++        assert_eq!(
++            rendered,
++            "item_id=42\npid=7\nstarted_at=1767225600000\noutput_start=1767225601000\nrealtime=true\n\
++             args=-i \"/media/My Movie.mkv\" -vf \"drawtext=text=\\\"hi\\\"\"\n"
++        );
++    }
++
++    #[tokio::test]
++    async fn writes_each_report_with_header() {
++        let folder = tempfile::tempdir().unwrap();
++        let stdout: &[u8] = b"frame=10\nfps=25.0\nprogress=continue\nframe=20\nprogress=end\n";
++        let args = [Cow::Borrowed("-i"), Cow::Borrowed("in.mkv")];
++
++        spawn_progress_writer(
++            stdout,
++            folder.path().to_path_buf(),
++            ProgressHeader {
++                item_id: "1",
++                pid: None,
++                realtime: false,
++                output_start: OffsetDateTime::now_utc(),
++                args: &args,
++            },
++        )
++        .await
++        .unwrap();
++
++        let contents = std::fs::read_to_string(folder.path().join(PROGRESS_FILE_NAME)).unwrap();
++        assert!(contents.contains("\npid=\n"));
++        assert!(contents.ends_with("args=-i in.mkv\nseq=2\nframe=20\nprogress=end\n"));
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+
