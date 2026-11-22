@@ -116,26 +116,41 @@ if [ -f "$WORKDIR/src/ErsatzTV/ErsatzTV.csproj" ]; then
         || sed -i '' '/Scanner/d' "$WORKDIR/src/ErsatzTV/ErsatzTV.csproj"
 fi
 
+# Roslyn/csc exit 137 = SIGKILL (OOM). Keep MSBuild single-threaded on small LXCs.
+DOTNET_PUBLISH_FLAGS=(
+    -c release
+    -r linux-x64
+    --self-contained false
+    -nologo
+    -v minimal
+    -m:1
+    /p:BuildInParallel=false
+    /p:UseSharedCompilation=false
+    /p:DebugType=Embedded
+    /p:InformationalVersion="$VERSION"
+)
+
 publish_one() {
     proj=$1
     [ -f "$WORKDIR/src/$proj" ] || die "missing $proj after patches"
     if command -v dotnet >/dev/null 2>&1; then
         export PATH="${HOME}/.dotnet:${PATH:-}"
         [ -d "${HOME}/.dotnet" ] && export DOTNET_ROOT="${HOME}/.dotnet"
-        dotnet publish "$WORKDIR/src/$proj" -c release -o "$WORKDIR/ctx/app" -r linux-x64 \
-            --self-contained false -nologo -v quiet \
-            /p:DebugType=Embedded /p:InformationalVersion="$VERSION"
+        export DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1
+        dotnet publish "$WORKDIR/src/$proj" "${DOTNET_PUBLISH_FLAGS[@]}" \
+            -o "$WORKDIR/ctx/app"
     else
-        echo "    (dotnet SDK via ${DOTNET_SDK_IMAGE})"
+        echo "    (dotnet SDK via ${DOTNET_SDK_IMAGE}; single-threaded to avoid OOM)"
         # Source must be writable — NuGet writes obj/ under the project tree.
+        mkdir -p "${CACHE}/nuget"
         docker run --rm \
             -v "$WORKDIR/src:/src" \
             -v "$WORKDIR/ctx/app:/out" \
+            -v "${CACHE}/nuget:/root/.nuget/packages" \
             -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+            -e DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1 \
             "$DOTNET_SDK_IMAGE" \
-            dotnet publish "/src/$proj" -c release -o /out -r linux-x64 \
-                --self-contained false -nologo -v quiet \
-                /p:DebugType=Embedded /p:InformationalVersion="$VERSION"
+            dotnet publish "/src/$proj" "${DOTNET_PUBLISH_FLAGS[@]}" -o /out
     fi
 }
 
