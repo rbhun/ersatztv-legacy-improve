@@ -79,21 +79,24 @@ def append_log(msg: str) -> None:
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """Run a command, streaming stdout/stderr into the agent log as they arrive."""
     append_log("$ " + " ".join(cmd))
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
         text=True,
-        capture_output=True,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
     )
-    if proc.stdout:
-        for line in proc.stdout.splitlines():
-            append_log(line)
-    if proc.stderr:
-        for line in proc.stderr.splitlines():
-            append_log(line)
-    return proc
+    assert proc.stdout is not None
+    collected: list[str] = []
+    for line in proc.stdout:
+        text = line.rstrip("\n")
+        collected.append(text)
+        append_log(text)
+    returncode = proc.wait()
+    return subprocess.CompletedProcess(cmd, returncode, "\n".join(collected), "")
 
 
 def git_head(repo: Path) -> str | None:
