@@ -3579,3 +3579,13 @@ the output frame rate and each report's wall clock time to `ffmpeg-progress.txt`
 back to that frame rate when there is no `-r` (fixes the buffer), times speed by the report
 time instead of when the page read it, and measures bitrate from the HLS segment files, since
 ffmpeg reports no size for the hls muxer.
+
+## 2026-11-22 (6) — Underrun log
+
+Legacy patch 0012 adds an underrun log to System → Performance. A background service checks
+every streaming channel once a second, whether or not the page is open. An underrun starts
+when the buffer ahead of live reaches zero (after a 30 s grace period at session start) and
+ends when it is back above 2 s, so one stall is logged once. Each underrun records duration,
+lowest buffer, slowest speed, item, realtime/work-ahead, hardware decode/encode and CPU. It is
+logged as a warning, appended to `underruns.jsonl` in the logs folder (rotated at 5 MB), and the
+page shows counts and stalled time for the last 24 hours and 7 days, per channel.

@@ -1,0 +1,627 @@
+From e2fa0ed7d2585a818591ba810049a6b7f15aad00 Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sun, 22 Nov 2026 18:24:22 +0100
+Subject: [PATCH] feat: log underruns on performance page
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+Co-authored-by: rbhun <rbhun@users.noreply.github.com>
+---
+ CHANGELOG.md                                  |   2 +
+ .../FFmpeg/UnderrunDetectorTests.cs           | 121 ++++++++++++++++++
+ ErsatzTV.Core/FFmpeg/UnderrunDetector.cs      | 102 +++++++++++++++
+ ErsatzTV.Core/FFmpeg/UnderrunLog.cs           | 103 +++++++++++++++
+ ErsatzTV/Pages/Performance.razor              | 113 ++++++++++++++++
+ ErsatzTV/Services/UnderrunMonitorService.cs   |  63 +++++++++
+ ErsatzTV/Startup.cs                           |   2 +
+ 7 files changed, 506 insertions(+)
+ create mode 100644 ErsatzTV.Core.Tests/FFmpeg/UnderrunDetectorTests.cs
+ create mode 100644 ErsatzTV.Core/FFmpeg/UnderrunDetector.cs
+ create mode 100644 ErsatzTV.Core/FFmpeg/UnderrunLog.cs
+ create mode 100644 ErsatzTV/Services/UnderrunMonitorService.cs
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 733b7eb1..15048b1e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+   - Whether video decode and encode are actually using hardware acceleration, including GPU filters and software fallbacks
+   - History of recent items per channel
+   - Channels using the ErsatzTV Next engine are included when the Next channel binary publishes ffmpeg progress
++  - Underrun log: every time a channel's buffer ahead of live reaches zero, with counts for the last 24 hours and 7 days
++    - Checked every second in the background, logged as a warning, and kept in `underruns.jsonl` in the logs folder
+ 
+ ## [26.13.0] - 2026-11-20
+ ### Changed
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/UnderrunDetectorTests.cs b/ErsatzTV.Core.Tests/FFmpeg/UnderrunDetectorTests.cs
+new file mode 100644
+index 00000000..a5715fbe
+--- /dev/null
++++ b/ErsatzTV.Core.Tests/FFmpeg/UnderrunDetectorTests.cs
+@@ -0,0 +1,121 @@
++using ErsatzTV.Core.FFmpeg;
++using NUnit.Framework;
++using Shouldly;
++
++namespace ErsatzTV.Core.Tests.FFmpeg;
++
++[TestFixture]
++public class UnderrunDetectorTests
++{
++    private static readonly DateTimeOffset SessionStart = new(2026, 11, 22, 18, 0, 0, TimeSpan.Zero);
++
++    private static HlsSessionPerformanceModel Session(double? buffer, double? speed = 0.8) =>
++        new(
++            "2",
++            "next",
++            true,
++            SessionStart,
++            buffer,
++            new FFmpegTranscodePerformance(
++                42,
++                false,
++                false,
++                SessionStart,
++                null,
++                null,
++                new FFmpegProgressSnapshot(null, speed, null, null, null, null, null, null, null),
++                55,
++                50,
++                FFmpegAccelerationInfo.Unknown with { IsHardwareDecode = true }),
++            []);
++
++    [Test]
++    public void Records_One_Underrun_Until_Buffer_Recovers()
++    {
++        var detector = new UnderrunDetector(TimeSpan.FromSeconds(30));
++        DateTimeOffset t = SessionStart.AddMinutes(5);
++
++        detector.Update(t, [Session(3)]).Started.ShouldBeEmpty();
++
++        (List<UnderrunEvent> started, _) = detector.Update(t.AddSeconds(1), [Session(-0.2)]);
++        started.Count.ShouldBe(1);
++        started[0].MediaItemId.ShouldBe(42);
++        started[0].IsHardwareDecode.ShouldBe(true);
++
++        // dipping and partly recovering stays one underrun
++        detector.Update(t.AddSeconds(2), [Session(-1.5, 0.6)]).Started.ShouldBeEmpty();
++        detector.Update(t.AddSeconds(3), [Session(1)]).Ended.ShouldBeEmpty();
++        detector.Ongoing.Count.ShouldBe(1);
++
++        (_, List<UnderrunEvent> ended) = detector.Update(t.AddSeconds(6), [Session(2.5, 1.2)]);
++        ended.Count.ShouldBe(1);
++        ended[0].Duration.ShouldBe(TimeSpan.FromSeconds(5));
++        ended[0].MinBufferSeconds.ShouldBe(-1.5);
++        ended[0].SlowestSpeed.ShouldBe(0.6);
++        ended[0].EndedBySessionStop.ShouldBeFalse();
++        detector.Ongoing.ShouldBeEmpty();
++    }
++
++    [Test]
++    public void Ignores_Empty_Buffer_While_Session_Starts()
++    {
++        var detector = new UnderrunDetector(TimeSpan.FromSeconds(30));
++
++        detector.Update(SessionStart.AddSeconds(5), [Session(0)]).Started.ShouldBeEmpty();
++        detector.Update(SessionStart.AddSeconds(31), [Session(0)]).Started.Count.ShouldBe(1);
++    }
++
++    [Test]
++    public void Ends_Underrun_When_Session_Stops()
++    {
++        var detector = new UnderrunDetector(TimeSpan.Zero);
++        DateTimeOffset t = SessionStart.AddMinutes(1);
++
++        detector.Update(t, [Session(-1)]);
++        (_, List<UnderrunEvent> ended) = detector.Update(t.AddSeconds(4), []);
++
++        ended.Count.ShouldBe(1);
++        ended[0].EndedBySessionStop.ShouldBeTrue();
++        ended[0].Duration.ShouldBe(TimeSpan.FromSeconds(4));
++    }
++
++    [Test]
++    public void Unknown_Buffer_Neither_Starts_Nor_Ends()
++    {
++        var detector = new UnderrunDetector(TimeSpan.Zero);
++        DateTimeOffset t = SessionStart.AddMinutes(1);
++
++        detector.Update(t, [Session(null)]).Started.ShouldBeEmpty();
++        detector.Update(t.AddSeconds(1), [Session(-1)]);
++        detector.Update(t.AddSeconds(2), [Session(null)]).Ended.ShouldBeEmpty();
++        detector.Ongoing.Count.ShouldBe(1);
++    }
++
++    [Test]
++    public void Log_Persists_Finished_Underruns()
++    {
++        string folder = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
++        string path = Path.Combine(folder, "underruns.jsonl");
++        try
++        {
++            var detector = new UnderrunDetector(TimeSpan.Zero);
++            DateTimeOffset t = SessionStart.AddMinutes(1);
++            detector.Update(t, [Session(-1)]);
++            UnderrunEvent finished = detector.Update(t.AddSeconds(3), [Session(5)]).Ended.Single();
++
++            var log = new UnderrunLog(path);
++            log.Add(finished);
++            log.SetOngoing([finished with { ChannelNumber = "7", EndedAt = null }]);
++            log.GetEvents().Select(e => e.ChannelNumber).ShouldBe(["7", "2"]);
++
++            new UnderrunLog(path).GetEvents().ShouldBe([finished]);
++        }
++        finally
++        {
++            if (Directory.Exists(folder))
++            {
++                Directory.Delete(folder, true);
++            }
++        }
++    }
++}
+diff --git a/ErsatzTV.Core/FFmpeg/UnderrunDetector.cs b/ErsatzTV.Core/FFmpeg/UnderrunDetector.cs
+new file mode 100644
+index 00000000..a7b41e7c
+--- /dev/null
++++ b/ErsatzTV.Core/FFmpeg/UnderrunDetector.cs
+@@ -0,0 +1,102 @@
++namespace ErsatzTV.Core.FFmpeg;
++
++// an underrun is the transcoded output falling behind live, which stalls every client of the channel
++public record UnderrunEvent(
++    string ChannelNumber,
++    string Engine,
++    DateTimeOffset StartedAt,
++    DateTimeOffset? EndedAt,
++    double MinBufferSeconds,
++    double? SlowestSpeed,
++    double? CpuPercent,
++    int? MediaItemId,
++    bool IsWorkingAhead,
++    bool? IsHardwareDecode,
++    bool? IsHardwareEncode,
++    bool EndedBySessionStop)
++{
++    public TimeSpan? Duration => EndedAt - StartedAt;
++}
++
++public sealed class UnderrunDetector(TimeSpan startupGrace)
++{
++    // sessions start with an empty buffer while the first segments are produced
++    public static readonly TimeSpan DefaultStartupGrace = TimeSpan.FromSeconds(30);
++
++    // require some headroom before calling it recovered, so one underrun is not logged as many
++    public const double RecoveredBufferSeconds = 2.0;
++
++    private readonly Dictionary<string, UnderrunEvent> _open = new(StringComparer.Ordinal);
++
++    public List<UnderrunEvent> Ongoing => _open.Values.OrderBy(e => e.StartedAt).ToList();
++
++    public (List<UnderrunEvent> Started, List<UnderrunEvent> Ended) Update(
++        DateTimeOffset now,
++        IReadOnlyCollection<HlsSessionPerformanceModel> sessions)
++    {
++        var started = new List<UnderrunEvent>();
++        var ended = new List<UnderrunEvent>();
++
++        foreach (string channelNumber in _open.Keys.ToList())
++        {
++            if (sessions.All(s => s.ChannelNumber != channelNumber))
++            {
++                ended.Add(_open[channelNumber] with { EndedAt = now, EndedBySessionStop = true });
++                _open.Remove(channelNumber);
++            }
++        }
++
++        foreach (HlsSessionPerformanceModel session in sessions)
++        {
++            if (!session.IsSupported || session.BufferSeconds is not { } buffer || session.ChannelNumber is null)
++            {
++                continue;
++            }
++
++            FFmpegTranscodePerformance current = session.Current;
++            if (_open.TryGetValue(session.ChannelNumber, out UnderrunEvent open))
++            {
++                UnderrunEvent updated = open with
++                {
++                    MinBufferSeconds = Math.Min(open.MinBufferSeconds, buffer),
++                    SlowestSpeed = Min(open.SlowestSpeed, current?.Progress.CurrentSpeed),
++                    CpuPercent = current?.CpuPercent ?? open.CpuPercent,
++                    MediaItemId = current?.MediaItemId ?? open.MediaItemId
++                };
++
++                if (buffer >= RecoveredBufferSeconds)
++                {
++                    ended.Add(updated with { EndedAt = now });
++                    _open.Remove(session.ChannelNumber);
++                }
++                else
++                {
++                    _open[session.ChannelNumber] = updated;
++                }
++            }
++            else if (buffer <= 0 && now - session.StartedAt >= startupGrace)
++            {
++                var underrun = new UnderrunEvent(
++                    session.ChannelNumber,
++                    session.State,
++                    now,
++                    null,
++                    buffer,
++                    current?.Progress.CurrentSpeed,
++                    current?.CpuPercent,
++                    current?.MediaItemId,
++                    current?.IsWorkingAhead ?? false,
++                    current?.Acceleration.IsHardwareDecode,
++                    current?.Acceleration.IsHardwareEncode,
++                    false);
++                _open[session.ChannelNumber] = underrun;
++                started.Add(underrun);
++            }
++        }
++
++        return (started, ended);
++    }
++
++    private static double? Min(double? a, double? b) =>
++        a is { } x && b is { } y ? Math.Min(x, y) : a ?? b;
++}
+diff --git a/ErsatzTV.Core/FFmpeg/UnderrunLog.cs b/ErsatzTV.Core/FFmpeg/UnderrunLog.cs
+new file mode 100644
+index 00000000..d055ec49
+--- /dev/null
++++ b/ErsatzTV.Core/FFmpeg/UnderrunLog.cs
+@@ -0,0 +1,103 @@
++using System.Text.Json;
++
++namespace ErsatzTV.Core.FFmpeg;
++
++// finished underruns are appended to a json lines file so the history survives restarts
++public sealed class UnderrunLog
++{
++    private const int MaxEvents = 2000;
++    private const long MaxFileBytes = 5 * 1024 * 1024;
++
++    private readonly Lock _sync = new();
++    private readonly string _path;
++    private readonly List<UnderrunEvent> _events = [];
++    private List<UnderrunEvent> _ongoing = [];
++
++    public UnderrunLog(string path)
++    {
++        _path = path;
++        Load();
++    }
++
++    public void Add(UnderrunEvent underrun)
++    {
++        lock (_sync)
++        {
++            _events.Add(underrun);
++            if (_events.Count > MaxEvents)
++            {
++                _events.RemoveRange(0, _events.Count - MaxEvents);
++            }
++
++            try
++            {
++                Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
++                if (File.Exists(_path) && new FileInfo(_path).Length > MaxFileBytes)
++                {
++                    File.Move(_path, _path + ".1", true);
++                }
++
++                File.AppendAllText(_path, JsonSerializer.Serialize(underrun) + Environment.NewLine);
++            }
++            catch (Exception)
++            {
++                // the in-memory log still has it
++            }
++        }
++    }
++
++    public void SetOngoing(List<UnderrunEvent> ongoing)
++    {
++        lock (_sync)
++        {
++            _ongoing = ongoing;
++        }
++    }
++
++    // ongoing underruns first, then finished ones, newest first
++    public List<UnderrunEvent> GetEvents()
++    {
++        lock (_sync)
++        {
++            return _ongoing
++                .OrderByDescending(e => e.StartedAt)
++                .Concat(_events.OrderByDescending(e => e.StartedAt))
++                .ToList();
++        }
++    }
++
++    private void Load()
++    {
++        try
++        {
++            if (!File.Exists(_path))
++            {
++                return;
++            }
++
++            foreach (string line in File.ReadLines(_path))
++            {
++                try
++                {
++                    if (JsonSerializer.Deserialize<UnderrunEvent>(line) is { } underrun)
++                    {
++                        _events.Add(underrun);
++                    }
++                }
++                catch (JsonException)
++                {
++                    // skip partial lines
++                }
++            }
++
++            if (_events.Count > MaxEvents)
++            {
++                _events.RemoveRange(0, _events.Count - MaxEvents);
++            }
++        }
++        catch (Exception)
++        {
++            // start with an empty log
++        }
++    }
++}
+diff --git a/ErsatzTV/Pages/Performance.razor b/ErsatzTV/Pages/Performance.razor
+index 694ea19a..ce8eae85 100644
+--- a/ErsatzTV/Pages/Performance.razor
++++ b/ErsatzTV/Pages/Performance.razor
+@@ -8,6 +8,7 @@
+ @implements IDisposable
+ @inject IMediator Mediator
+ @inject IFFmpegSegmenterService SegmenterService
++@inject UnderrunLog UnderrunLog
+ 
+ <MudForm Style="max-height: 100%">
+     <div class="d-flex flex-column" style="height: 100vh; overflow-x: auto">
+@@ -19,6 +20,90 @@
+                 Speed must stay at or above 1.0x and the buffer must stay above zero, or clients will stall.
+                 Duplicated or dropped frames come from frame rate conversion inside ffmpeg; players do not count these as dropped frames.
+             </MudText>
++            <MudPaper Class="pa-6 mb-6">
++                <MudText Typo="Typo.h6" Class="mb-2">Underruns</MudText>
++                <MudText Typo="Typo.body2" Class="mb-4">
++                    An underrun is when a channel's buffer ahead of live reaches zero, so every client watching it stalls.
++                    All streaming channels are checked every second, even when this page is closed.
++                </MudText>
++                @{
++                    DateTimeOffset now = DateTimeOffset.Now;
++                    List<UnderrunEvent> lastDay = _underruns.Where(u => u.StartedAt >= now.AddDays(-1)).ToList();
++                    List<UnderrunEvent> lastWeek = _underruns.Where(u => u.StartedAt >= now.AddDays(-7)).ToList();
++                }
++                <div class="d-flex flex-row flex-wrap align-center mb-4" style="gap: 8px">
++                    <MudChip T="string" Size="Size.Small" Color="@(lastDay.Count > 0 ? Color.Error : Color.Success)">
++                        Last 24 hours: @lastDay.Count (@StallText(lastDay, now))
++                    </MudChip>
++                    <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined">
++                        Last 7 days: @lastWeek.Count (@StallText(lastWeek, now))
++                    </MudChip>
++                    @foreach (IGrouping<string, UnderrunEvent> channel in lastWeek.GroupBy(u => u.ChannelNumber).OrderByDescending(g => g.Count()))
++                    {
++                        <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined">
++                            @channel.Key - @ChannelName(channel.Key): @channel.Count() this week
++                        </MudChip>
++                    }
++                </div>
++                @if (_underruns.Count == 0)
++                {
++                    <MudText Typo="Typo.body2">No underruns recorded.</MudText>
++                }
++                else
++                {
++                    <MudSimpleTable Dense="true" Hover="true" Style="overflow-x: auto">
++                        <thead>
++                        <tr>
++                            <th>Started</th>
++                            <th>Channel</th>
++                            <th>Stalled for</th>
++                            <th>Lowest buffer</th>
++                            <th>Slowest speed</th>
++                            <th>Item</th>
++                            <th>Mode</th>
++                            <th>Decode</th>
++                            <th>Encode</th>
++                            <th>CPU</th>
++                        </tr>
++                        </thead>
++                        <tbody>
++                        @foreach (UnderrunEvent underrun in _underruns.Take(MaxUnderrunRows))
++                        {
++                            <tr>
++                                <td style="white-space: nowrap">@underrun.StartedAt.ToLocalTime().ToString("g", CultureInfo.CurrentCulture)</td>
++                                <td>@underrun.ChannelNumber - @ChannelName(underrun.ChannelNumber)</td>
++                                <td style="white-space: nowrap">
++                                    @if (underrun.EndedAt is null)
++                                    {
++                                        <MudText Typo="Typo.body2" Color="Color.Error">@($"{(now - underrun.StartedAt).TotalSeconds:0}s, ongoing")</MudText>
++                                    }
++                                    else
++                                    {
++                                        @($"{underrun.Duration?.TotalSeconds:0.0}s")
++                                        @if (underrun.EndedBySessionStop)
++                                        {
++                                            <MudTooltip Text="The channel stopped before the buffer recovered">
++                                                <MudText Typo="Typo.caption" Class="ml-1">(channel stopped)</MudText>
++                                            </MudTooltip>
++                                        }
++                                    }
++                                </td>
++                                <td>@($"{underrun.MinBufferSeconds:0.0}s")</td>
++                                <td><MudText Typo="Typo.body2" Color="@SpeedColor(underrun.SlowestSpeed, underrun.IsWorkingAhead)">@Speed(underrun.SlowestSpeed)</MudText></td>
++                                <td>@UnderrunItem(underrun)</td>
++                                <td>@(underrun.IsWorkingAhead ? "Work ahead" : "Realtime")</td>
++                                <td>@UnderrunHw(underrun.IsHardwareDecode)</td>
++                                <td>@UnderrunHw(underrun.IsHardwareEncode)</td>
++                                <td>@Percent(underrun.CpuPercent)</td>
++                            </tr>
++                        }
++                        </tbody>
++                    </MudSimpleTable>
++                    <MudText Typo="Typo.caption" Class="mt-2">
++                        Kept in the logs folder as underruns.jsonl.
++                    </MudText>
++                }
++            </MudPaper>
+             @if (_sessions.Count == 0)
+             {
+                 <MudPaper Class="pa-6">
+@@ -258,7 +343,10 @@
+     private readonly CancellationTokenSource _cts = new();
+     private readonly Dictionary<int, Option<MediaItemInfo>> _mediaItemInfo = [];
+     private readonly System.Collections.Generic.HashSet<int> _pendingMediaItemInfo = [];
++    private const int MaxUnderrunRows = 50;
++
+     private List<HlsSessionPerformanceModel> _sessions = [];
++    private List<UnderrunEvent> _underruns = [];
+     private List<ChannelViewModel> _channels = [];
+     private List<FFmpegProfileViewModel> _profiles = [];
+     private bool _channelsStale = true;
+@@ -310,10 +398,13 @@
+             .OrderBy(s => decimal.TryParse(s.ChannelNumber, CultureInfo.InvariantCulture, out decimal n) ? n : decimal.MaxValue)
+             .ToList();
+ 
++        _underruns = UnderrunLog.GetEvents();
++
+         var mediaItemIds = _sessions
+             .SelectMany(s => s.History.Append(s.Current))
+             .Where(p => p?.MediaItemId is not null)
+             .Select(p => p.MediaItemId.Value)
++            .Concat(_underruns.Take(MaxUnderrunRows).Where(u => u.MediaItemId is not null).Select(u => u.MediaItemId.Value))
+             .Distinct()
+             .Where(id => !_mediaItemInfo.ContainsKey(id) && !_pendingMediaItemInfo.Contains(id))
+             .ToList();
+@@ -336,6 +427,28 @@
+     private Option<MediaItemInfo> GetMediaItemInfo(int? mediaItemId) =>
+         mediaItemId is { } id && _mediaItemInfo.TryGetValue(id, out Option<MediaItemInfo> info) ? info : None;
+ 
++    private string ChannelName(string channelNumber) =>
++        Optional(_channels.Find(c => c.Number == channelNumber)).Map(c => c.Name).IfNone("Unknown channel");
++
++    private string UnderrunItem(UnderrunEvent underrun) =>
++        GetMediaItemInfo(underrun.MediaItemId).Match(
++            info => info.Title,
++            () => underrun.MediaItemId is { } id ? $"Media item {id}" : "Unknown item");
++
++    private static string UnderrunHw(bool? isHardware) =>
++        isHardware switch
++        {
++            true => "Hardware",
++            false => "Software",
++            null => "-"
++        };
++
++    private static string StallText(List<UnderrunEvent> underruns, DateTimeOffset now)
++    {
++        double seconds = underruns.Sum(u => ((u.EndedAt ?? now) - u.StartedAt).TotalSeconds);
++        return seconds < 120 ? $"{seconds:0}s stalled" : $"{seconds / 60:0.0} min stalled";
++    }
++
+     private static string ItemTitle(FFmpegTranscodePerformance performance, Option<MediaItemInfo> maybeInfo)
+     {
+         if (performance.IsSlug)
+diff --git a/ErsatzTV/Services/UnderrunMonitorService.cs b/ErsatzTV/Services/UnderrunMonitorService.cs
+new file mode 100644
+index 00000000..d6296e39
+--- /dev/null
++++ b/ErsatzTV/Services/UnderrunMonitorService.cs
+@@ -0,0 +1,63 @@
++using ErsatzTV.Core.FFmpeg;
++using ErsatzTV.Core.Interfaces.FFmpeg;
++
++namespace ErsatzTV.Services;
++
++// watches every streaming channel, whether or not the performance page is open
++public class UnderrunMonitorService(
++    IFFmpegSegmenterService segmenterService,
++    UnderrunLog underrunLog,
++    ILogger<UnderrunMonitorService> logger)
++    : BackgroundService
++{
++    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
++    {
++        var detector = new UnderrunDetector(UnderrunDetector.DefaultStartupGrace);
++
++        try
++        {
++            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
++            while (await timer.WaitForNextTickAsync(stoppingToken))
++            {
++                try
++                {
++                    List<HlsSessionPerformanceModel> sessions = segmenterService.Workers
++                        .ToList()
++                        .Map(w => w.GetPerformance())
++                        .ToList();
++
++                    (List<UnderrunEvent> started, List<UnderrunEvent> ended) =
++                        detector.Update(DateTimeOffset.Now, sessions);
++
++                    foreach (UnderrunEvent underrun in started)
++                    {
++                        logger.LogWarning(
++                            "Underrun on channel {Channel}: transcoding fell behind live (speed {Speed:0.00}x); clients will stall",
++                            underrun.ChannelNumber,
++                            underrun.SlowestSpeed);
++                    }
++
++                    foreach (UnderrunEvent underrun in ended)
++                    {
++                        underrunLog.Add(underrun);
++                        logger.LogWarning(
++                            "Underrun on channel {Channel} ended after {Duration:0.0}s, lowest buffer {Buffer:0.0}s",
++                            underrun.ChannelNumber,
++                            underrun.Duration?.TotalSeconds,
++                            underrun.MinBufferSeconds);
++                    }
++
++                    underrunLog.SetOngoing(detector.Ongoing);
++                }
++                catch (Exception ex)
++                {
++                    logger.LogDebug(ex, "Failed to check channels for underruns");
++                }
++            }
++        }
++        catch (OperationCanceledException)
++        {
++            // do nothing
++        }
++    }
++}
+diff --git a/ErsatzTV/Startup.cs b/ErsatzTV/Startup.cs
+index 6fe9c083..747b9f79 100644
+--- a/ErsatzTV/Startup.cs
++++ b/ErsatzTV/Startup.cs
+@@ -814,6 +814,7 @@ private static void CustomServices(IServiceCollection services)
+         services.AddSingleton<IScannerProxyService, ScannerProxyService>();
+         services.AddSingleton<IScriptedPlayoutBuilderService, ScriptedPlayoutBuilderService>();
+         services.AddSingleton<IFFmpegSegmenterService, FFmpegSegmenterService>();
++        services.AddSingleton(_ => new UnderrunLog(Path.Combine(FileSystemLayout.LogsFolder, "underruns.jsonl")));
+         services.AddSingleton<ITempFilePool, TempFilePool>();
+         services.AddSingleton<IHlsPlaylistFilter, HlsPlaylistFilter>();
+         services.AddSingleton<RecyclableMemoryStreamManager>();
+@@ -968,6 +969,7 @@ private static void CustomServices(IServiceCollection services)
+         services.AddHostedService<SchedulerService>();
+         services.AddHostedService<FFmpegWorkerService>();
+         services.AddHostedService<SearchIndexService>();
++        services.AddHostedService<UnderrunMonitorService>();
+     }
+ 
+     private static void AddChannel<TMessageType>(IServiceCollection services)
+-- 
+2.54.0 (Apple Git-157)
+
