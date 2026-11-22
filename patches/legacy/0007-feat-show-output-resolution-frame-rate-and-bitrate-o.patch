@@ -1,0 +1,371 @@
+From 0a0997915cb9f9fd4726d0fb9747625868cce0af Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Sat, 21 Nov 2026 11:13:16 +0100
+Subject: [PATCH 2/2] feat: show output resolution, frame rate and bitrate on
+ performance page
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ CHANGELOG.md                                  |  1 +
+ .../FFmpeg/FFmpegAccelerationInfoTests.cs     | 25 ++++++++
+ .../FFmpeg/FFmpegProgressTests.cs             | 22 ++++++-
+ .../FFmpeg/FFmpegAccelerationInfo.cs          | 28 ++++++++-
+ ErsatzTV.Core/FFmpeg/FFmpegProgress.cs        | 28 +++++++--
+ ErsatzTV/Pages/Performance.razor              | 60 +++++++++++++++++--
+ 6 files changed, 148 insertions(+), 16 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ec068915..9170f444 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ ### Added
+ - Add `System` > `Performance` page with live transcoding statistics for each active HLS Segmenter / MPEG-TS session
+   - Buffer ahead of live, transcode speed (current, average, slowest) and ffmpeg CPU usage
++  - Output resolution and frame rate compared to the source, and output bitrate (current, average, profile target)
+   - Dropped and duplicated frames reported by ffmpeg, with a note when source and output frame rates differ
+   - Whether video decode and encode are actually using hardware acceleration, including GPU filters and software fallbacks
+   - History of recent items per channel
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs b/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
+index fa525e23..9b1092a5 100644
+--- a/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
++++ b/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
+@@ -24,6 +24,31 @@ public void Software_Decode_And_Encode()
+         result.OutputFrameRate.ShouldBe("30000/1001");
+         result.HardwareFilters.ShouldBeEmpty();
+         result.OutputFrameRateValue.IfNone(0).ShouldBe(29.97, 0.001);
++        result.OutputWidth.ShouldBeNull();
++        result.VideoBitrate.ShouldBe("2000k");
++    }
++
++    [Test]
++    public void Output_Size_Prefers_Pad_Over_Scale()
++    {
++        const string ARGUMENTS =
++            "-i /tmp/a.mkv -i /tmp/logo.png -filter_complex [1:0]scale=200:-1[wm];[0:0]scale=1920:800:force_original_aspect_ratio=decrease,pad=1920:1080:-1:-1:color=black[v];[v][wm]overlay[vo] -c:v libx264 -b:v 6000k -f mpegts pipe:1";
++
++        FFmpegAccelerationInfo result = FFmpegAccelerationInfo.FromArguments(ARGUMENTS);
++
++        result.OutputWidth.ShouldBe(1920);
++        result.OutputHeight.ShouldBe(1080);
++        result.VideoBitrate.ShouldBe("6000k");
++    }
++
++    [Test]
++    public void Output_Size_From_Hardware_Scale()
++    {
++        FFmpegAccelerationInfo result = FFmpegAccelerationInfo.FromArguments(
++            "-hwaccel vaapi -i /tmp/a.mkv -filter_complex [0:0]scale_vaapi=1280:720:force_original_aspect_ratio=decrease[v] -c:v h264_vaapi -f mpegts pipe:1");
++
++        result.OutputWidth.ShouldBe(1280);
++        result.OutputHeight.ShouldBe(720);
+     }
+ 
+     [Test]
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs b/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
+index 9de72c67..8788b778 100644
+--- a/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
++++ b/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
+@@ -35,7 +35,7 @@ public void Parses_Progress_Block()
+         FFmpegProgressSnapshot snapshot = progress.GetSnapshot();
+         snapshot.Frame.ShouldBe(1440);
+         snapshot.Fps.ShouldBe(29.97);
+-        snapshot.Bitrate.ShouldBe("2048.3kbits/s");
++        snapshot.BitrateKbps.ShouldBe(2048.3);
+         snapshot.DuplicatedFrames.ShouldBe(12);
+         snapshot.DroppedFrames.ShouldBe(3);
+         snapshot.Speed.ShouldBe(1.01);
+@@ -52,11 +52,29 @@ public void Ignores_Unavailable_Values()
+         progress.ParseLine("progress=continue");
+ 
+         FFmpegProgressSnapshot snapshot = progress.GetSnapshot();
+-        snapshot.Bitrate.ShouldBeNull();
++        snapshot.BitrateKbps.ShouldBeNull();
+         snapshot.Speed.ShouldBeNull();
+         snapshot.CurrentSpeed.ShouldBeNull();
+     }
+ 
++    [Test]
++    public async Task Calculates_Current_Bitrate_Between_Reports()
++    {
++        var progress = new FFmpegProgress();
++        progress.ParseLine("total_size=1000000");
++        progress.ParseLine("out_time_us=10000000");
++        progress.ParseLine("progress=continue");
++
++        await Task.Delay(300);
++
++        // 750,000 bytes over 1 second of output = 6,000 kbps
++        progress.ParseLine("total_size=1750000");
++        progress.ParseLine("out_time_us=11000000");
++        progress.ParseLine("progress=continue");
++
++        progress.GetSnapshot().CurrentBitrateKbps.ShouldBe(6000);
++    }
++
+     [Test]
+     public void Parses_Legacy_Stats_Line_Speed()
+     {
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs b/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
+index bddd7dad..400c79da 100644
+--- a/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
++++ b/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
+@@ -13,7 +13,10 @@ public partial record FFmpegAccelerationInfo(
+     bool IsVideoCopy,
+     string OutputFrameRate,
+     List<string> HardwareFilters,
+-    bool DownloadsFromHardware)
++    bool DownloadsFromHardware,
++    int? OutputWidth,
++    int? OutputHeight,
++    string VideoBitrate)
+ {
+     private static readonly string[] HardwareCodecSuffixes =
+     [
+@@ -23,7 +26,7 @@ public partial record FFmpegAccelerationInfo(
+     private static readonly string[] FilterOptions = ["-filter_complex", "-vf", "-filter:v"];
+ 
+     public static readonly FFmpegAccelerationInfo Unknown =
+-        new(null, null, false, null, false, false, null, [], false);
++        new(null, null, false, null, false, false, null, [], false, null, null, null);
+ 
+     public Option<double> OutputFrameRateValue => ParseFrameRate(OutputFrameRate);
+ 
+@@ -71,6 +74,16 @@ public static FFmpegAccelerationInfo FromArguments(string arguments)
+             .Distinct()
+             .ToList();
+ 
++        // padding always produces the final frame size; otherwise the last explicit scale does
++        Match sizeMatch = PadSize().Matches(filters).LastOrDefault() ?? ScaleSize().Matches(filters).LastOrDefault();
++        int? outputWidth = null;
++        int? outputHeight = null;
++        if (sizeMatch is not null && !isVideoCopy)
++        {
++            outputWidth = int.Parse(sizeMatch.Groups[1].Value, CultureInfo.InvariantCulture);
++            outputHeight = int.Parse(sizeMatch.Groups[2].Value, CultureInfo.InvariantCulture);
++        }
++
+         return new FFmpegAccelerationInfo(
+             hwaccel,
+             decoder,
+@@ -80,7 +93,10 @@ public static FFmpegAccelerationInfo FromArguments(string arguments)
+             isVideoCopy,
+             LastValue(tokens, "-r", outputStart, tokens.Count),
+             hardwareFilters,
+-            filters.Contains("hwdownload", StringComparison.Ordinal));
++            filters.Contains("hwdownload", StringComparison.Ordinal),
++            outputWidth,
++            outputHeight,
++            LastValue(tokens, "-b:v", outputStart, tokens.Count));
+     }
+ 
+     public static Option<double> ParseFrameRate(string frameRate)
+@@ -172,4 +188,10 @@ private static List<string> Tokenize(string arguments)
+ 
+     [GeneratedRegex(@"\b(hwupload\w*|hwmap|[a-z0-9]+_(cuda|npp|vaapi|qsv|vt|videotoolbox|opencl|vulkan|rkrga))\b")]
+     private static partial Regex HardwareFilter();
++
++    [GeneratedRegex(@"\bpad\w*=(?:w=)?(\d+):(?:h=)?(\d+)")]
++    private static partial Regex PadSize();
++
++    [GeneratedRegex(@"\b(?:scale|scale_\w+|vpp_qsv)=(?:w=)?(\d+):(?:h=)?(\d+)")]
++    private static partial Regex ScaleSize();
+ }
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs b/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
+index 2d06a2b3..9f04631a 100644
+--- a/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
++++ b/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
+@@ -18,7 +18,10 @@ public partial class FFmpegProgress
+     private long? _frame;
+     private long? _droppedFrames;
+     private long? _duplicatedFrames;
+-    private string _bitrate;
++    private double? _bitrateKbps;
++    private double? _currentBitrateKbps;
++    private long? _totalSize;
++    private long? _lastReportTotalSize;
+     private TimeSpan? _outTime;
+     private TimeSpan? _lastReportOutTime;
+     private long _lastReportTimestamp;
+@@ -47,7 +50,8 @@ public FFmpegProgressSnapshot GetSnapshot()
+                 _frame,
+                 _droppedFrames,
+                 _duplicatedFrames,
+-                _bitrate);
++                _bitrateKbps,
++                _currentBitrateKbps);
+         }
+     }
+ 
+@@ -89,8 +93,12 @@ public void ParseLine(string line)
+                 case "dup_frames" when TryParseLong(value, out long duplicated):
+                     _duplicatedFrames = duplicated;
+                     break;
+-                case "bitrate":
+-                    _bitrate = value == "N/A" ? null : value;
++                case "bitrate" when value.EndsWith("kbits/s", StringComparison.Ordinal) &&
++                                    TryParseDouble(value[..^"kbits/s".Length], out double bitrate):
++                    _bitrateKbps = bitrate;
++                    break;
++                case "total_size" when TryParseLong(value, out long totalSize):
++                    _totalSize = totalSize;
+                     break;
+                 case "out_time_us" when TryParseLong(value, out long outTimeUs) && outTimeUs >= 0:
+                     _outTime = TimeSpan.FromTicks(outTimeUs * 10);
+@@ -165,9 +173,15 @@ private void CompleteReport()
+                 return;
+             }
+ 
+-            double currentSpeed = (outTime - lastOutTime).TotalSeconds / wallSeconds;
++            double outSeconds = (outTime - lastOutTime).TotalSeconds;
++            double currentSpeed = outSeconds / wallSeconds;
+             _currentSpeed = currentSpeed;
+ 
++            if (outSeconds > 0 && _totalSize is { } totalSize && _lastReportTotalSize is { } lastTotalSize)
++            {
++                _currentBitrateKbps = (totalSize - lastTotalSize) * 8 / outSeconds / 1000;
++            }
++
+             if (_reportCount > WarmupReports)
+             {
+                 _slowestSpeed = _slowestSpeed is { } slowest ? Math.Min(slowest, currentSpeed) : currentSpeed;
+@@ -175,6 +189,7 @@ private void CompleteReport()
+         }
+ 
+         _lastReportOutTime = outTime;
++        _lastReportTotalSize = _totalSize;
+         _lastReportTimestamp = now;
+     }
+ 
+@@ -196,4 +211,5 @@ public record FFmpegProgressSnapshot(
+     long? Frame,
+     long? DroppedFrames,
+     long? DuplicatedFrames,
+-    string Bitrate);
++    double? BitrateKbps,
++    double? CurrentBitrateKbps);
+diff --git a/ErsatzTV/Pages/Performance.razor b/ErsatzTV/Pages/Performance.razor
+index 9a9054e6..89dc71f4 100644
+--- a/ErsatzTV/Pages/Performance.razor
++++ b/ErsatzTV/Pages/Performance.razor
+@@ -60,9 +60,10 @@
+                     {
+                         FFmpegTranscodePerformance current = session.Current;
+                         FFmpegTranscodePerformance latest = current ?? session.History.FirstOrDefault();
++                        Option<MediaItemInfo> latestInfo = GetMediaItemInfo(latest?.MediaItemId);
+ 
+                     <MudGrid Spacing="2" Class="mb-4">
+-                        <MudItem xs="12" sm="6" md="3">
++                        <MudItem xs="12" sm="6" md="4">
+                             <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
+                                 <MudText Typo="Typo.caption">Buffer ahead of live</MudText>
+                                 <MudText Typo="Typo.h5" Color="@BufferColor(session.BufferSeconds)">
+@@ -71,7 +72,7 @@
+                                 <MudText Typo="Typo.caption">Clients stall when this reaches 0</MudText>
+                             </MudPaper>
+                         </MudItem>
+-                        <MudItem xs="12" sm="6" md="3">
++                        <MudItem xs="12" sm="6" md="4">
+                             <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
+                                 <MudText Typo="Typo.caption">Transcode speed (now / average / slowest)</MudText>
+                                 @if (latest is not null)
+@@ -93,7 +94,7 @@
+                                 }
+                             </MudPaper>
+                         </MudItem>
+-                        <MudItem xs="12" sm="6" md="3">
++                        <MudItem xs="12" sm="6" md="4">
+                             <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
+                                 <MudText Typo="Typo.caption">ffmpeg CPU (now / average)</MudText>
+                                 <MudText Typo="Typo.h5">
+@@ -102,7 +103,7 @@
+                                 <MudText Typo="Typo.caption">100% = one full core (@Environment.ProcessorCount cores available)</MudText>
+                             </MudPaper>
+                         </MudItem>
+-                        <MudItem xs="12" sm="6" md="3">
++                        <MudItem xs="12" sm="6" md="4">
+                             <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
+                                 <MudText Typo="Typo.caption">Frames (dropped / duplicated)</MudText>
+                                 <MudText Typo="Typo.h5">
+@@ -111,7 +112,29 @@
+                                     <MudText Inline="true" Typo="Typo.h5" Color="@CountColor(latest?.Progress.DuplicatedFrames)">@Count(latest?.Progress.DuplicatedFrames)</MudText>
+                                 </MudText>
+                                 <MudText Typo="Typo.caption">
+-                                    @Count(latest?.Progress.Frame) frames at @(latest?.Progress.Fps is { } fps ? $"{fps:0.#} fps" : "-")@(string.IsNullOrWhiteSpace(latest?.Progress.Bitrate) ? "" : $", {latest.Progress.Bitrate}")
++                                    @Count(latest?.Progress.Frame) frames, encoding at @(latest?.Progress.Fps is { } fps ? $"{fps:0.#} fps" : "-")
++                                </MudText>
++                            </MudPaper>
++                        </MudItem>
++                        <MudItem xs="12" sm="6" md="4">
++                            <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
++                                <MudText Typo="Typo.caption">Output video</MudText>
++                                <MudText Typo="Typo.h5">
++                                    @OutputResolution(latest?.Acceleration, latestInfo)
++                                    <MudText Inline="true" Typo="Typo.h6">@@ @OutputFrameRate(latest?.Acceleration, latestInfo)</MudText>
++                                </MudText>
++                                <MudText Typo="Typo.caption">Source @SourceResolution(latestInfo) @@ @SourceFrameRate(latestInfo)</MudText>
++                            </MudPaper>
++                        </MudItem>
++                        <MudItem xs="12" sm="6" md="4">
++                            <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
++                                <MudText Typo="Typo.caption">Bitrate (now / average)</MudText>
++                                <MudText Typo="Typo.h5">
++                                    @Bitrate(current?.Progress.CurrentBitrateKbps)
++                                    <MudText Inline="true" Typo="Typo.h6"> / @Bitrate(latest?.Progress.BitrateKbps)</MudText>
++                                </MudText>
++                                <MudText Typo="Typo.caption">
++                                    Video and audio combined@(string.IsNullOrWhiteSpace(latest?.Acceleration.VideoBitrate) ? "" : $"; profile video target {TargetBitrate(latest.Acceleration.VideoBitrate)}")
+                                 </MudText>
+                             </MudPaper>
+                         </MudItem>
+@@ -176,6 +199,8 @@
+                                 <th>Slowest</th>
+                                 <th>Dropped</th>
+                                 <th>Duplicated</th>
++                                <th>Output</th>
++                                <th>Avg bitrate</th>
+                                 <th>Avg CPU</th>
+                                 <th>Decode</th>
+                                 <th>Encode</th>
+@@ -194,6 +219,8 @@
+                                     <td><MudText Typo="Typo.body2" Color="@SpeedColor(item.Progress.SlowestSpeed, item.IsWorkingAhead)">@Speed(item.Progress.SlowestSpeed)</MudText></td>
+                                     <td><MudText Typo="Typo.body2" Color="@CountColor(item.Progress.DroppedFrames)">@Count(item.Progress.DroppedFrames)</MudText></td>
+                                     <td><MudText Typo="Typo.body2" Color="@CountColor(item.Progress.DuplicatedFrames)">@Count(item.Progress.DuplicatedFrames)</MudText></td>
++                                    <td style="white-space: nowrap">@OutputResolution(item.Acceleration, itemInfo) @@ @OutputFrameRate(item.Acceleration, itemInfo)</td>
++                                    <td style="white-space: nowrap">@Bitrate(item.Progress.BitrateKbps)</td>
+                                     <td>@Percent(item.AverageCpuPercent)</td>
+                                     <td>@HwLabel(item.Acceleration.IsHardwareDecode, item.Acceleration.IsVideoCopy)</td>
+                                     <td>@HwLabel(item.Acceleration.IsHardwareEncode, item.Acceleration.IsVideoCopy)</td>
+@@ -455,6 +482,29 @@
+     private static string FrameRateText(string frameRate) =>
+         FFmpegAccelerationInfo.ParseFrameRate(frameRate).Match(fps => fps.ToString("0.###", CultureInfo.CurrentCulture), () => frameRate);
+ 
++    private static string SourceResolution(Option<MediaItemInfo> maybeInfo) =>
++        maybeInfo.Filter(i => i.Width > 0 && i.Height > 0).Match(i => $"{i.Width}x{i.Height}", () => "-");
++
++    private static string SourceFrameRate(Option<MediaItemInfo> maybeInfo) =>
++        maybeInfo.Filter(i => !string.IsNullOrWhiteSpace(i.RFrameRate)).Match(i => $"{FrameRateText(i.RFrameRate)} fps", () => "-");
++
++    // without an explicit scale/pad or frame rate, ffmpeg keeps the source value
++    private static string OutputResolution(FFmpegAccelerationInfo accel, Option<MediaItemInfo> maybeInfo) =>
++        accel is { OutputWidth: { } width, OutputHeight: { } height } ? $"{width}x{height}" : SourceResolution(maybeInfo);
++
++    private static string OutputFrameRate(FFmpegAccelerationInfo accel, Option<MediaItemInfo> maybeInfo) =>
++        string.IsNullOrWhiteSpace(accel?.OutputFrameRate) ? SourceFrameRate(maybeInfo) : $"{FrameRateText(accel.OutputFrameRate)} fps";
++
++    private static string Bitrate(double? kbps) => kbps switch
++    {
++        null => "-",
++        >= 1000 => $"{kbps.Value / 1000:0.0} Mbps",
++        _ => $"{kbps.Value:0} kbps"
++    };
++
++    private static string TargetBitrate(string bitrate) =>
++        bitrate.EndsWith('k') && double.TryParse(bitrate[..^1], CultureInfo.InvariantCulture, out double kbps) ? Bitrate(kbps) : bitrate;
++
+     private static string Speed(double? speed) => speed is { } s ? $"{s:0.00}x" : "-";
+ 
+     private static string Percent(double? percent) => percent is { } p ? $"{p:0}%" : "-";
+-- 
+2.54.0 (Apple Git-157)
+

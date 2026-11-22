@@ -1,0 +1,1482 @@
+From cc791645f46e5d4cea1543e4fd8028c7ec005a14 Mon Sep 17 00:00:00 2001
+From: Balazs Rozgonyi <rbhun@me.com>
+Date: Fri, 20 Nov 2026 21:09:28 +0100
+Subject: [PATCH 1/2] feat: add live transcoding performance page
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ CHANGELOG.md                                  |   6 +
+ .../Streaming/HlsSessionWorker.cs             |  81 ++-
+ .../Streaming/NextSessionWorker.cs            |   3 +
+ .../FFmpeg/FFmpegAccelerationInfoTests.cs     |  92 ++++
+ .../FFmpeg/FFmpegProgressTests.cs             |  68 +++
+ .../FFmpeg/FFmpegAccelerationInfo.cs          | 175 +++++++
+ ErsatzTV.Core/FFmpeg/FFmpegProgress.cs        | 152 +++++-
+ .../FFmpeg/FFmpegTranscodeMonitor.cs          | 170 ++++++
+ .../FFmpeg/HlsSessionPerformanceModel.cs      |  26 +
+ .../Interfaces/FFmpeg/IHlsSessionWorker.cs    |   1 +
+ ErsatzTV/Locals/Shared/MainLayout.Designer.cs |   6 +
+ ErsatzTV/Locals/Shared/MainLayout.resx        |   3 +
+ ErsatzTV/Pages/Performance.razor              | 483 ++++++++++++++++++
+ ErsatzTV/Shared/MainLayout.razor              |   1 +
+ 14 files changed, 1260 insertions(+), 7 deletions(-)
+ create mode 100644 ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
+ create mode 100644 ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
+ create mode 100644 ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
+ create mode 100644 ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
+ create mode 100644 ErsatzTV.Core/FFmpeg/HlsSessionPerformanceModel.cs
+ create mode 100644 ErsatzTV/Pages/Performance.razor
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 172be1ee..ec068915 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ 
+ ## [Unreleased]
++### Added
++- Add `System` > `Performance` page with live transcoding statistics for each active HLS Segmenter / MPEG-TS session
++  - Buffer ahead of live, transcode speed (current, average, slowest) and ffmpeg CPU usage
++  - Dropped and duplicated frames reported by ffmpeg, with a note when source and output frame rates differ
++  - Whether video decode and encode are actually using hardware acceleration, including GPU filters and software fallbacks
++  - History of recent items per channel
+ 
+ ## [26.13.0] - 2026-11-20
+ ### Changed
+diff --git a/ErsatzTV.Application/Streaming/HlsSessionWorker.cs b/ErsatzTV.Application/Streaming/HlsSessionWorker.cs
+index cfd888af..aea84650 100644
+--- a/ErsatzTV.Application/Streaming/HlsSessionWorker.cs
++++ b/ErsatzTV.Application/Streaming/HlsSessionWorker.cs
+@@ -26,6 +26,7 @@ namespace ErsatzTV.Application.Streaming;
+ 
+ public class HlsSessionWorker : IHlsSessionWorker
+ {
++    private const int MaxPerformanceHistory = 25;
+     private static int _workAheadCount;
+     private readonly OutputFormatKind _outputFormatKind;
+     private readonly IHlsInitSegmentCache _hlsInitSegmentCache;
+@@ -39,7 +40,10 @@ public class HlsSessionWorker : IHlsSessionWorker
+     private readonly IMediator _mediator;
+     private readonly SemaphoreSlim _slim = new(1, 1);
+     private readonly Lock _sync = new();
++    private readonly Lock _performanceSync = new();
++    private readonly LinkedList<FFmpegTranscodePerformance> _performanceHistory = [];
+     private readonly Option<FrameRate> _targetFramerate;
++    private FFmpegTranscodeMonitor _currentTranscode;
+     private CancellationTokenSource _cancellationTokenSource;
+     private string _channelNumber;
+     private DateTimeOffset _channelStart;
+@@ -169,6 +173,61 @@ public async Task<Option<TrimPlaylistResult>> TrimPlaylist(
+     public HlsSessionModel GetModel() =>
+         new(_channelNumber, _state.ToString(), _transcodedUntil, _lastAccess, _channelStart);
+ 
++    public HlsSessionPerformanceModel GetPerformance()
++    {
++        lock (_performanceSync)
++        {
++            DateTimeOffset transcodedUntil = _transcodedUntil;
++            FFmpegTranscodePerformance current = null;
++            if (_currentTranscode is not null)
++            {
++                current = _currentTranscode.GetPerformance();
++                foreach (DateTimeOffset until in _currentTranscode.TranscodedUntil)
++                {
++                    transcodedUntil = until;
++                }
++            }
++
++            return new HlsSessionPerformanceModel(
++                _channelNumber,
++                _state.ToString(),
++                true,
++                _channelStart,
++                (transcodedUntil - DateTimeOffset.Now).TotalSeconds,
++                current,
++                _performanceHistory.ToList());
++        }
++    }
++
++    private void StartTranscodeMonitor(FFmpegTranscodeMonitor monitor)
++    {
++        lock (_performanceSync)
++        {
++            _currentTranscode = monitor;
++        }
++    }
++
++    private void CompleteTranscodeMonitor(FFmpegTranscodeMonitor monitor, bool? succeeded)
++    {
++        monitor.Complete(succeeded);
++
++        lock (_performanceSync)
++        {
++            if (ReferenceEquals(_currentTranscode, monitor))
++            {
++                _currentTranscode = null;
++            }
++
++            _performanceHistory.AddFirst(monitor.GetPerformance());
++            while (_performanceHistory.Count > MaxPerformanceHistory)
++            {
++                _performanceHistory.RemoveLast();
++            }
++        }
++
++        monitor.Dispose();
++    }
++
+     void IDisposable.Dispose()
+     {
+         Dispose(true);
+@@ -543,6 +602,15 @@ private async Task<bool> Transcode(bool realtime, CancellationToken cancellation
+ 
+                 _logger.LogDebug("ffmpeg hls arguments {FFmpegArguments}", process.Arguments);
+ 
++                var monitor = new FFmpegTranscodeMonitor(
++                    processModel.MediaItemId,
++                    processModel.IsWorkingAhead,
++                    isSlug,
++                    now,
++                    process.Arguments);
++                bool? succeeded = null;
++                StartTranscodeMonitor(monitor);
++
+                 try
+                 {
+                     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+@@ -561,15 +629,20 @@ private async Task<bool> Transcode(bool realtime, CancellationToken cancellation
+                             linkedCts.Token);
+                     }
+ 
+-                    var progressParser = new FFmpegProgress();
++                    FFmpegProgress progressParser = monitor.Progress;
+ 
+-                    CommandResult commandResult = await processWithPipe
++                    CommandTask<CommandResult> commandTask = processWithPipe
+                         .WithWorkingDirectory(_workingDirectory)
+                         .WithStandardErrorPipe(PipeTarget.ToStringBuilder(stdErrBuffer))
+-                        .WithStandardOutputPipe(PipeTarget.ToDelegate(progressParser.ParseLine))
++                        .WithStandardOutputPipe(PipeTarget.ToDelegate(monitor.ParseLine))
+                         .WithValidation(CommandResultValidation.None)
+                         .ExecuteAsync(linkedCts.Token);
+ 
++                    monitor.AttachProcess(commandTask.ProcessId);
++
++                    CommandResult commandResult = await commandTask;
++                    succeeded = commandResult.ExitCode == 0;
++
+                     if (commandResult.ExitCode == 0)
+                     {
+                         _logger.LogDebug("HLS process has completed for channel {Channel}", _channelNumber);
+@@ -653,6 +726,8 @@ private async Task<bool> Transcode(bool realtime, CancellationToken cancellation
+                 }
+                 finally
+                 {
++                    CompleteTranscodeMonitor(monitor, succeeded);
++
+                     foreach (Pipe pipe in maybePipe)
+                     {
+                         await pipe.Writer.CompleteAsync();
+diff --git a/ErsatzTV.Application/Streaming/NextSessionWorker.cs b/ErsatzTV.Application/Streaming/NextSessionWorker.cs
+index 339a09d9..d3449db1 100644
+--- a/ErsatzTV.Application/Streaming/NextSessionWorker.cs
++++ b/ErsatzTV.Application/Streaming/NextSessionWorker.cs
+@@ -104,6 +104,9 @@ public void PlayoutUpdated()
+ 
+     public HlsSessionModel GetModel() => new(_channelNumber, "next", null, _lastTouch, _sessionStart);
+ 
++    public HlsSessionPerformanceModel GetPerformance() =>
++        HlsSessionPerformanceModel.NotSupported(_channelNumber, "next", _sessionStart);
++
+     public async Task Run(
+         string channelNumber,
+         Option<TimeSpan> idleTimeout,
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs b/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
+new file mode 100644
+index 00000000..fa525e23
+--- /dev/null
++++ b/ErsatzTV.Core.Tests/FFmpeg/FFmpegAccelerationInfoTests.cs
+@@ -0,0 +1,92 @@
++using ErsatzTV.Core.FFmpeg;
++using NUnit.Framework;
++using Shouldly;
++
++namespace ErsatzTV.Core.Tests.FFmpeg;
++
++[TestFixture]
++public class FFmpegAccelerationInfoTests
++{
++    [Test]
++    public void Software_Decode_And_Encode()
++    {
++        const string ARGUMENTS =
++            "-nostdin -hide_banner -nostats -progress - -loglevel error -fflags +genpts+discardcorrupt+igndts -ss 1000ms -c:v h264 -readrate 1.05 -i /tmp/whatever.mkv -filter_complex [0:1]aresample=async=1[a] -map 0:0 -map [a] -b:v 2000k -c:v libx265 -tag:v hvc1 -c:a aac -r 30000/1001 -vsync cfr -f mpegts pipe:1";
++
++        FFmpegAccelerationInfo result = FFmpegAccelerationInfo.FromArguments(ARGUMENTS);
++
++        result.HardwareAcceleration.ShouldBeNull();
++        result.VideoDecoder.ShouldBe("h264");
++        result.IsHardwareDecode.ShouldBeFalse();
++        result.VideoEncoder.ShouldBe("libx265");
++        result.IsHardwareEncode.ShouldBeFalse();
++        result.IsVideoCopy.ShouldBeFalse();
++        result.OutputFrameRate.ShouldBe("30000/1001");
++        result.HardwareFilters.ShouldBeEmpty();
++        result.OutputFrameRateValue.IfNone(0).ShouldBe(29.97, 0.001);
++    }
++
++    [Test]
++    public void VideoToolbox_Decode_And_Encode()
++    {
++        const string ARGUMENTS =
++            "-nostdin -hwaccel videotoolbox -readrate 1.0 -i \"/media/My Movie (2020).mkv\" -filter_complex \"[0:0]scale_vt=w=1920:h=1080,hwdownload,format=nv12,pad=1920:1080[v]\" -map [v] -c:v h264_videotoolbox -r 24 -f mpegts pipe:1";
++
++        FFmpegAccelerationInfo result = FFmpegAccelerationInfo.FromArguments(ARGUMENTS);
++
++        result.HardwareAcceleration.ShouldBe("videotoolbox");
++        result.VideoDecoder.ShouldBeNull();
++        result.IsHardwareDecode.ShouldBeTrue();
++        result.VideoEncoder.ShouldBe("h264_videotoolbox");
++        result.IsHardwareEncode.ShouldBeTrue();
++        result.HardwareFilters.ShouldBe(["scale_vt"]);
++        result.DownloadsFromHardware.ShouldBeTrue();
++    }
++
++    [Test]
++    public void Nvidia_Cuvid_Decoder_With_Graphics_Input()
++    {
++        const string ARGUMENTS =
++            "-init_hw_device cuda -c:v hevc_cuvid -i /tmp/a.mkv -f rawvideo -pix_fmt bgra -r 30 -c:v rawvideo -i pipe:0 -filter_complex [0:0]scale_cuda=1280:720,hwupload_cuda[v] -c:v h264_nvenc -r 30 -f mpegts pipe:1";
++
++        FFmpegAccelerationInfo result = FFmpegAccelerationInfo.FromArguments(ARGUMENTS);
++
++        result.HardwareAcceleration.ShouldBeNull();
++        result.VideoDecoder.ShouldBe("hevc_cuvid");
++        result.IsHardwareDecode.ShouldBeTrue();
++        result.VideoEncoder.ShouldBe("h264_nvenc");
++        result.IsHardwareEncode.ShouldBeTrue();
++        result.HardwareFilters.ShouldBe(["scale_cuda", "hwupload_cuda"]);
++        result.DownloadsFromHardware.ShouldBeFalse();
++    }
++
++    [Test]
++    public void Copy()
++    {
++        const string ARGUMENTS =
++            "-nostdin -readrate 1.0 -i /tmp/whatever.mkv -map 0:0 -map 0:1 -c:v copy -c:a copy -f mp4 pipe:1";
++
++        FFmpegAccelerationInfo result = FFmpegAccelerationInfo.FromArguments(ARGUMENTS);
++
++        result.IsVideoCopy.ShouldBeTrue();
++        result.VideoEncoder.ShouldBe("copy");
++        result.IsHardwareEncode.ShouldBeFalse();
++    }
++
++    [Test]
++    public void Copy_All()
++    {
++        FFmpegAccelerationInfo result =
++            FFmpegAccelerationInfo.FromArguments("-i http://localhost/concat -c copy -f mpegts pipe:1");
++
++        result.IsVideoCopy.ShouldBeTrue();
++        result.VideoEncoder.ShouldBe("copy");
++    }
++
++    [Test]
++    public void Empty_Is_Unknown()
++    {
++        FFmpegAccelerationInfo.FromArguments(string.Empty).ShouldBe(FFmpegAccelerationInfo.Unknown);
++        FFmpegAccelerationInfo.FromArguments("-version").ShouldBe(FFmpegAccelerationInfo.Unknown);
++    }
++}
+diff --git a/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs b/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
+new file mode 100644
+index 00000000..9de72c67
+--- /dev/null
++++ b/ErsatzTV.Core.Tests/FFmpeg/FFmpegProgressTests.cs
+@@ -0,0 +1,68 @@
++using ErsatzTV.Core.FFmpeg;
++using NUnit.Framework;
++using Shouldly;
++
++namespace ErsatzTV.Core.Tests.FFmpeg;
++
++[TestFixture]
++public class FFmpegProgressTests
++{
++    [Test]
++    public void Parses_Progress_Block()
++    {
++        var progress = new FFmpegProgress();
++        string[] lines =
++        [
++            "frame=1440",
++            "fps=29.97",
++            "stream_0_0_q=-1.0",
++            "bitrate=2048.3kbits/s",
++            "total_size=12345678",
++            "out_time_us=48048000",
++            "out_time_ms=48048000",
++            "out_time=00:00:48.048000",
++            "dup_frames=12",
++            "drop_frames=3",
++            "speed=1.01x",
++            "progress=continue"
++        ];
++
++        foreach (string line in lines)
++        {
++            progress.ParseLine(line);
++        }
++
++        FFmpegProgressSnapshot snapshot = progress.GetSnapshot();
++        snapshot.Frame.ShouldBe(1440);
++        snapshot.Fps.ShouldBe(29.97);
++        snapshot.Bitrate.ShouldBe("2048.3kbits/s");
++        snapshot.DuplicatedFrames.ShouldBe(12);
++        snapshot.DroppedFrames.ShouldBe(3);
++        snapshot.Speed.ShouldBe(1.01);
++        progress.Speed.IfNone(0).ShouldBe(1.01);
++    }
++
++    [Test]
++    public void Ignores_Unavailable_Values()
++    {
++        var progress = new FFmpegProgress();
++        progress.ParseLine("bitrate=N/A");
++        progress.ParseLine("out_time_us=N/A");
++        progress.ParseLine("speed=N/A");
++        progress.ParseLine("progress=continue");
++
++        FFmpegProgressSnapshot snapshot = progress.GetSnapshot();
++        snapshot.Bitrate.ShouldBeNull();
++        snapshot.Speed.ShouldBeNull();
++        snapshot.CurrentSpeed.ShouldBeNull();
++    }
++
++    [Test]
++    public void Parses_Legacy_Stats_Line_Speed()
++    {
++        var progress = new FFmpegProgress();
++        progress.ParseLine("frame=  100 fps= 25 q=28.0 size=     256kB time=00:00:04.00 bitrate= 524.3kbits/s speed=2.5x");
++
++        progress.Speed.IfNone(0).ShouldBe(2.5);
++    }
++}
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs b/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
+new file mode 100644
+index 00000000..bddd7dad
+--- /dev/null
++++ b/ErsatzTV.Core/FFmpeg/FFmpegAccelerationInfo.cs
+@@ -0,0 +1,175 @@
++using System.Globalization;
++using System.Text;
++using System.Text.RegularExpressions;
++
++namespace ErsatzTV.Core.FFmpeg;
++
++public partial record FFmpegAccelerationInfo(
++    string HardwareAcceleration,
++    string VideoDecoder,
++    bool IsHardwareDecode,
++    string VideoEncoder,
++    bool IsHardwareEncode,
++    bool IsVideoCopy,
++    string OutputFrameRate,
++    List<string> HardwareFilters,
++    bool DownloadsFromHardware)
++{
++    private static readonly string[] HardwareCodecSuffixes =
++    [
++        "_cuvid", "_nvenc", "_qsv", "_vaapi", "_videotoolbox", "_amf", "_v4l2m2m", "_rkmpp", "_mf", "_vulkan"
++    ];
++
++    private static readonly string[] FilterOptions = ["-filter_complex", "-vf", "-filter:v"];
++
++    public static readonly FFmpegAccelerationInfo Unknown =
++        new(null, null, false, null, false, false, null, [], false);
++
++    public Option<double> OutputFrameRateValue => ParseFrameRate(OutputFrameRate);
++
++    public static FFmpegAccelerationInfo FromArguments(string arguments)
++    {
++        if (string.IsNullOrWhiteSpace(arguments))
++        {
++            return Unknown;
++        }
++
++        List<string> tokens = Tokenize(arguments);
++        int firstInput = tokens.IndexOf("-i");
++        int lastInput = tokens.LastIndexOf("-i");
++        if (firstInput < 0)
++        {
++            return Unknown;
++        }
++
++        // global options and video input options both come before the first input, which is always the video
++        string hwaccel = LastValue(tokens, "-hwaccel", 0, firstInput);
++        if (hwaccel is "none")
++        {
++            hwaccel = null;
++        }
++
++        string decoder = LastValue(tokens, "-c:v", 0, firstInput);
++        bool isHardwareDecode = hwaccel is not null || IsHardwareCodec(decoder);
++
++        int outputStart = Math.Min(tokens.Count, lastInput + 2);
++        string encoder = LastValue(tokens, "-c:v", outputStart, tokens.Count);
++        bool isVideoCopy = encoder is "copy" || encoder is null && LastValue(tokens, "-c", outputStart, tokens.Count) is "copy";
++        if (encoder is null && isVideoCopy)
++        {
++            encoder = "copy";
++        }
++
++        string filters = string.Join(
++            ';',
++            FilterOptions
++                .Map(option => LastValue(tokens, option, 0, tokens.Count))
++                .Filter(f => f is not null));
++
++        var hardwareFilters = HardwareFilter().Matches(filters)
++            .Select(m => m.Value)
++            .Distinct()
++            .ToList();
++
++        return new FFmpegAccelerationInfo(
++            hwaccel,
++            decoder,
++            isHardwareDecode,
++            encoder,
++            IsHardwareCodec(encoder),
++            isVideoCopy,
++            LastValue(tokens, "-r", outputStart, tokens.Count),
++            hardwareFilters,
++            filters.Contains("hwdownload", StringComparison.Ordinal));
++    }
++
++    public static Option<double> ParseFrameRate(string frameRate)
++    {
++        if (string.IsNullOrWhiteSpace(frameRate))
++        {
++            return None;
++        }
++
++        string[] split = frameRate.Split('/');
++        if (split.Length == 2 &&
++            double.TryParse(split[0], NumberStyles.Float, CultureInfo.InvariantCulture, out double numerator) &&
++            double.TryParse(split[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double denominator) &&
++            denominator > 0)
++        {
++            return numerator / denominator;
++        }
++
++        if (double.TryParse(frameRate, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) && value > 0)
++        {
++            return value;
++        }
++
++        return None;
++    }
++
++    private static bool IsHardwareCodec(string codec) =>
++        !string.IsNullOrWhiteSpace(codec) &&
++        HardwareCodecSuffixes.Any(suffix => codec.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
++
++    private static string LastValue(List<string> tokens, string option, int start, int end)
++    {
++        string result = null;
++        for (int i = start; i < end - 1; i++)
++        {
++            if (tokens[i] == option)
++            {
++                result = tokens[i + 1];
++            }
++        }
++
++        return result;
++    }
++
++    private static List<string> Tokenize(string arguments)
++    {
++        var result = new List<string>();
++        var current = new StringBuilder();
++        var inQuotes = false;
++        var hasToken = false;
++
++        for (var i = 0; i < arguments.Length; i++)
++        {
++            char c = arguments[i];
++            if (c == '\\' && i + 1 < arguments.Length && arguments[i + 1] == '"')
++            {
++                current.Append('"');
++                hasToken = true;
++                i++;
++            }
++            else if (c == '"')
++            {
++                inQuotes = !inQuotes;
++                hasToken = true;
++            }
++            else if (char.IsWhiteSpace(c) && !inQuotes)
++            {
++                if (hasToken)
++                {
++                    result.Add(current.ToString());
++                    current.Clear();
++                    hasToken = false;
++                }
++            }
++            else
++            {
++                current.Append(c);
++                hasToken = true;
++            }
++        }
++
++        if (hasToken)
++        {
++            result.Add(current.ToString());
++        }
++
++        return result;
++    }
++
++    [GeneratedRegex(@"\b(hwupload\w*|hwmap|[a-z0-9]+_(cuda|npp|vaapi|qsv|vt|videotoolbox|opencl|vulkan|rkrga))\b")]
++    private static partial Regex HardwareFilter();
++}
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs b/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
+index b2def683..2d06a2b3 100644
+--- a/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
++++ b/ErsatzTV.Core/FFmpeg/FFmpegProgress.cs
+@@ -1,3 +1,5 @@
++using System.Diagnostics;
++using System.Globalization;
+ using System.Text.RegularExpressions;
+ using Microsoft.Extensions.Logging;
+ 
+@@ -5,14 +7,98 @@ namespace ErsatzTV.Core.FFmpeg;
+ 
+ public partial class FFmpegProgress
+ {
+-    public Option<double> Speed { get; private set; } = Option<double>.None;
++    // the first few progress reports include startup/probing time and are not representative
++    private const int WarmupReports = 3;
++
++    private readonly Lock _sync = new();
++    private double? _speed;
++    private double? _currentSpeed;
++    private double? _slowestSpeed;
++    private double? _fps;
++    private long? _frame;
++    private long? _droppedFrames;
++    private long? _duplicatedFrames;
++    private string _bitrate;
++    private TimeSpan? _outTime;
++    private TimeSpan? _lastReportOutTime;
++    private long _lastReportTimestamp;
++    private int _reportCount;
++
++    public Option<double> Speed
++    {
++        get
++        {
++            lock (_sync)
++            {
++                return Optional(_speed);
++            }
++        }
++    }
++
++    public FFmpegProgressSnapshot GetSnapshot()
++    {
++        lock (_sync)
++        {
++            return new FFmpegProgressSnapshot(
++                _speed,
++                _currentSpeed,
++                _slowestSpeed,
++                _fps,
++                _frame,
++                _droppedFrames,
++                _duplicatedFrames,
++                _bitrate);
++        }
++    }
+ 
+     public void ParseLine(string line)
+     {
+-        Match match = FFmpegSpeed().Match(line);
+-        if (match.Success && double.TryParse(match.Groups[1].Value, out double speed))
++        if (string.IsNullOrWhiteSpace(line))
+         {
+-            Speed = speed;
++            return;
++        }
++
++        lock (_sync)
++        {
++            Match match = FFmpegSpeed().Match(line);
++            if (match.Success && TryParseDouble(match.Groups[1].Value, out double speed))
++            {
++                _speed = speed;
++            }
++
++            int separator = line.IndexOf('=');
++            if (separator <= 0)
++            {
++                return;
++            }
++
++            string key = line[..separator].Trim();
++            string value = line[(separator + 1)..].Trim();
++
++            switch (key)
++            {
++                case "frame" when TryParseLong(value, out long frame):
++                    _frame = frame;
++                    break;
++                case "fps" when TryParseDouble(value, out double fps):
++                    _fps = fps;
++                    break;
++                case "drop_frames" when TryParseLong(value, out long dropped):
++                    _droppedFrames = dropped;
++                    break;
++                case "dup_frames" when TryParseLong(value, out long duplicated):
++                    _duplicatedFrames = duplicated;
++                    break;
++                case "bitrate":
++                    _bitrate = value == "N/A" ? null : value;
++                    break;
++                case "out_time_us" when TryParseLong(value, out long outTimeUs) && outTimeUs >= 0:
++                    _outTime = TimeSpan.FromTicks(outTimeUs * 10);
++                    break;
++                case "progress":
++                    CompleteReport();
++                    break;
++            }
+         }
+     }
+ 
+@@ -48,8 +134,66 @@ public void LogSpeed(Option<int> mediaItemId, bool isWorkingAhead, string channe
+                     speed);
+             }
+         }
++
++        FFmpegProgressSnapshot snapshot = GetSnapshot();
++        if (snapshot.DroppedFrames > 0 || snapshot.DuplicatedFrames > 0)
++        {
++            logger.LogDebug(
++                "Media item {MediaItemId} on channel {Channel} dropped {Dropped} and duplicated {Duplicated} frames",
++                mediaItemId,
++                channelNumber,
++                snapshot.DroppedFrames,
++                snapshot.DuplicatedFrames);
++        }
+     }
+ 
++    private void CompleteReport()
++    {
++        _reportCount++;
++        long now = Stopwatch.GetTimestamp();
++
++        if (_outTime is not { } outTime)
++        {
++            return;
++        }
++
++        if (_lastReportOutTime is { } lastOutTime && _lastReportTimestamp > 0)
++        {
++            double wallSeconds = Stopwatch.GetElapsedTime(_lastReportTimestamp, now).TotalSeconds;
++            if (wallSeconds < 0.25)
++            {
++                return;
++            }
++
++            double currentSpeed = (outTime - lastOutTime).TotalSeconds / wallSeconds;
++            _currentSpeed = currentSpeed;
++
++            if (_reportCount > WarmupReports)
++            {
++                _slowestSpeed = _slowestSpeed is { } slowest ? Math.Min(slowest, currentSpeed) : currentSpeed;
++            }
++        }
++
++        _lastReportOutTime = outTime;
++        _lastReportTimestamp = now;
++    }
++
++    private static bool TryParseDouble(string value, out double result) =>
++        double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out result);
++
++    private static bool TryParseLong(string value, out long result) =>
++        long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out result);
++
+     [GeneratedRegex(@"speed=\s*([\d\.]+)x", RegexOptions.IgnoreCase)]
+     private static partial Regex FFmpegSpeed();
+ }
++
++public record FFmpegProgressSnapshot(
++    double? Speed,
++    double? CurrentSpeed,
++    double? SlowestSpeed,
++    double? Fps,
++    long? Frame,
++    long? DroppedFrames,
++    long? DuplicatedFrames,
++    string Bitrate);
+diff --git a/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs b/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
+new file mode 100644
+index 00000000..f1bc2abe
+--- /dev/null
++++ b/ErsatzTV.Core/FFmpeg/FFmpegTranscodeMonitor.cs
+@@ -0,0 +1,170 @@
++using System.Diagnostics;
++
++namespace ErsatzTV.Core.FFmpeg;
++
++public sealed class FFmpegTranscodeMonitor : IDisposable
++{
++    private readonly Lock _sync = new();
++    private readonly FFmpegProgress _progress = new();
++    private readonly DateTimeOffset _outputStart;
++    private readonly int? _mediaItemId;
++    private readonly bool _isWorkingAhead;
++    private readonly bool _isSlug;
++    private readonly DateTimeOffset _startedAt;
++    private Process _process;
++    private long _processAttachedTimestamp;
++    private long _lastCpuTimestamp;
++    private TimeSpan _lastCpuTime;
++    private double? _cpuPercent;
++    private double? _averageCpuPercent;
++    private DateTimeOffset? _finishedAt;
++    private bool? _succeeded;
++
++    public FFmpegTranscodeMonitor(
++        Option<int> mediaItemId,
++        bool isWorkingAhead,
++        bool isSlug,
++        DateTimeOffset outputStart,
++        string arguments)
++    {
++        _mediaItemId = mediaItemId.MatchUnsafe(id => (int?)id, () => null);
++        _isWorkingAhead = isWorkingAhead;
++        _isSlug = isSlug;
++        _outputStart = outputStart;
++        _startedAt = DateTimeOffset.Now;
++        Acceleration = FFmpegAccelerationInfo.FromArguments(arguments);
++    }
++
++    public FFmpegProgress Progress => _progress;
++
++    public FFmpegAccelerationInfo Acceleration { get; }
++
++    // wall clock time that the transcoded output currently reaches, when it can be determined
++    public Option<DateTimeOffset> TranscodedUntil
++    {
++        get
++        {
++            FFmpegProgressSnapshot snapshot = _progress.GetSnapshot();
++            foreach (double frameRate in Acceleration.OutputFrameRateValue)
++            {
++                if (snapshot.Frame is { } frames)
++                {
++                    return _outputStart.AddSeconds(frames / frameRate);
++                }
++            }
++
++            return None;
++        }
++    }
++
++    public void AttachProcess(int processId)
++    {
++        try
++        {
++            var process = Process.GetProcessById(processId);
++            lock (_sync)
++            {
++                _process = process;
++                _processAttachedTimestamp = Stopwatch.GetTimestamp();
++            }
++        }
++        catch (Exception)
++        {
++            // process may have already exited
++        }
++    }
++
++    public void ParseLine(string line)
++    {
++        _progress.ParseLine(line);
++
++        if (line.StartsWith("progress=", StringComparison.Ordinal))
++        {
++            SampleCpu();
++        }
++    }
++
++    public void Complete(bool? succeeded)
++    {
++        lock (_sync)
++        {
++            _finishedAt = DateTimeOffset.Now;
++            _succeeded = succeeded;
++            _cpuPercent = null;
++            ReleaseProcess();
++        }
++    }
++
++    public FFmpegTranscodePerformance GetPerformance()
++    {
++        lock (_sync)
++        {
++            return new FFmpegTranscodePerformance(
++                _mediaItemId,
++                _isWorkingAhead,
++                _isSlug,
++                _startedAt,
++                _finishedAt,
++                _succeeded,
++                _progress.GetSnapshot(),
++                _cpuPercent,
++                _averageCpuPercent,
++                Acceleration);
++        }
++    }
++
++    public void Dispose()
++    {
++        lock (_sync)
++        {
++            ReleaseProcess();
++        }
++    }
++
++    private void SampleCpu()
++    {
++        lock (_sync)
++        {
++            if (_process is null)
++            {
++                return;
++            }
++
++            try
++            {
++                _process.Refresh();
++                TimeSpan cpuTime = _process.TotalProcessorTime;
++                long now = Stopwatch.GetTimestamp();
++
++                if (_lastCpuTimestamp > 0)
++                {
++                    double wallSeconds = Stopwatch.GetElapsedTime(_lastCpuTimestamp, now).TotalSeconds;
++                    if (wallSeconds > 0)
++                    {
++                        _cpuPercent = (cpuTime - _lastCpuTime).TotalSeconds / wallSeconds * 100;
++                    }
++                }
++
++                double totalSeconds = Stopwatch.GetElapsedTime(_processAttachedTimestamp, now).TotalSeconds;
++                if (totalSeconds > 0)
++                {
++                    _averageCpuPercent = cpuTime.TotalSeconds / totalSeconds * 100;
++                }
++
++                _lastCpuTime = cpuTime;
++                _lastCpuTimestamp = now;
++            }
++            catch (Exception)
++            {
++                // process has exited or is inaccessible
++                ReleaseProcess();
++            }
++        }
++    }
++
++    private void ReleaseProcess()
++    {
++        _process?.Dispose();
++        _process = null;
++    }
++}
+diff --git a/ErsatzTV.Core/FFmpeg/HlsSessionPerformanceModel.cs b/ErsatzTV.Core/FFmpeg/HlsSessionPerformanceModel.cs
+new file mode 100644
+index 00000000..39ed6dff
+--- /dev/null
++++ b/ErsatzTV.Core/FFmpeg/HlsSessionPerformanceModel.cs
+@@ -0,0 +1,26 @@
++namespace ErsatzTV.Core.FFmpeg;
++
++public record HlsSessionPerformanceModel(
++    string ChannelNumber,
++    string State,
++    bool IsSupported,
++    DateTimeOffset StartedAt,
++    double? BufferSeconds,
++    FFmpegTranscodePerformance Current,
++    List<FFmpegTranscodePerformance> History)
++{
++    public static HlsSessionPerformanceModel NotSupported(string channelNumber, string state, DateTimeOffset startedAt) =>
++        new(channelNumber, state, false, startedAt, null, null, []);
++}
++
++public record FFmpegTranscodePerformance(
++    int? MediaItemId,
++    bool IsWorkingAhead,
++    bool IsSlug,
++    DateTimeOffset StartedAt,
++    DateTimeOffset? FinishedAt,
++    bool? Succeeded,
++    FFmpegProgressSnapshot Progress,
++    double? CpuPercent,
++    double? AverageCpuPercent,
++    FFmpegAccelerationInfo Acceleration);
+diff --git a/ErsatzTV.Core/Interfaces/FFmpeg/IHlsSessionWorker.cs b/ErsatzTV.Core/Interfaces/FFmpeg/IHlsSessionWorker.cs
+index a67c91db..eb314232 100644
+--- a/ErsatzTV.Core/Interfaces/FFmpeg/IHlsSessionWorker.cs
++++ b/ErsatzTV.Core/Interfaces/FFmpeg/IHlsSessionWorker.cs
+@@ -9,6 +9,7 @@ public interface IHlsSessionWorker : IDisposable
+     Task<Option<TrimPlaylistResult>> TrimPlaylist(DateTimeOffset filterBefore, CancellationToken cancellationToken);
+     void PlayoutUpdated();
+     HlsSessionModel GetModel();
++    HlsSessionPerformanceModel GetPerformance();
+     Task Run(string channelNumber, Option<TimeSpan> idleTimeout, CancellationToken incomingCancellationToken);
+     Task WaitForPlaylistSegments(int initialSegmentCount, CancellationToken cancellationToken);
+ }
+diff --git a/ErsatzTV/Locals/Shared/MainLayout.Designer.cs b/ErsatzTV/Locals/Shared/MainLayout.Designer.cs
+index 983d3895..d20dc9a1 100644
+--- a/ErsatzTV/Locals/Shared/MainLayout.Designer.cs
++++ b/ErsatzTV/Locals/Shared/MainLayout.Designer.cs
+@@ -309,6 +309,12 @@ internal static string ButtonSupportLogs {
+             }
+         }
+         
++        internal static string ButtonSupportPerformance {
++            get {
++                return ResourceManager.GetString("ButtonSupportPerformance", resourceCulture);
++            }
++        }
++        
+         internal static string ButtonSupportTroubleshooting {
+             get {
+                 return ResourceManager.GetString("ButtonSupportTroubleshooting", resourceCulture);
+diff --git a/ErsatzTV/Locals/Shared/MainLayout.resx b/ErsatzTV/Locals/Shared/MainLayout.resx
+index 11f4a266..5efa517f 100644
+--- a/ErsatzTV/Locals/Shared/MainLayout.resx
++++ b/ErsatzTV/Locals/Shared/MainLayout.resx
+@@ -150,6 +150,9 @@
+     <data name="ButtonSupportLogs" xml:space="preserve">
+         <value>Logs</value>
+     </data>
++    <data name="ButtonSupportPerformance" xml:space="preserve">
++        <value>Performance</value>
++    </data>
+     <data name="ButtonSupportTroubleshooting" xml:space="preserve">
+         <value>Troubleshooting</value>
+     </data>
+diff --git a/ErsatzTV/Pages/Performance.razor b/ErsatzTV/Pages/Performance.razor
+new file mode 100644
+index 00000000..9a9054e6
+--- /dev/null
++++ b/ErsatzTV/Pages/Performance.razor
+@@ -0,0 +1,483 @@
++@page "/system/performance"
++@using System.Globalization
++@using ErsatzTV.Application.Channels
++@using ErsatzTV.Application.FFmpegProfiles
++@using ErsatzTV.Application.MediaItems
++@using ErsatzTV.Core.FFmpeg
++@using ErsatzTV.Core.Interfaces.FFmpeg
++@implements IDisposable
++@inject IMediator Mediator
++@inject IFFmpegSegmenterService SegmenterService
++
++<MudForm Style="max-height: 100%">
++    <div class="d-flex flex-column" style="height: 100vh; overflow-x: auto">
++        <MudContainer MaxWidth="MaxWidth.ExtraLarge" Class="pt-8 pb-8">
++            <MudText Typo="Typo.h5" Class="mb-2">Performance</MudText>
++            <MudDivider Class="mb-6"/>
++            <MudText Typo="Typo.body2" Class="mb-6">
++                Live transcoding statistics for every active channel, updated every second.
++                Speed must stay at or above 1.0x and the buffer must stay above zero, or clients will stall.
++                Duplicated or dropped frames come from frame rate conversion inside ffmpeg; players do not count these as dropped frames.
++            </MudText>
++            @if (_sessions.Count == 0)
++            {
++                <MudPaper Class="pa-6">
++                    <MudText>No channels are streaming right now. Start playback on a channel to see its statistics here.</MudText>
++                    <MudText Typo="Typo.body2" Class="mt-2">
++                        Statistics are collected for channels using the HLS Segmenter and MPEG-TS streaming modes.
++                    </MudText>
++                </MudPaper>
++            }
++            @foreach (HlsSessionPerformanceModel session in _sessions)
++            {
++                Option<ChannelViewModel> maybeChannel = Optional(_channels.Find(c => c.Number == session.ChannelNumber));
++                Option<FFmpegProfileViewModel> maybeProfile = maybeChannel.Bind(c => Optional(_profiles.Find(p => p.Id == c.FFmpegProfileId)));
++                HardwareAccelerationKind configuredAccel = maybeProfile.Map(p => p.HardwareAcceleration).IfNone(HardwareAccelerationKind.None);
++
++                <MudPaper Class="pa-6 mb-6">
++                    <div class="d-flex flex-row flex-wrap align-center mb-4" style="gap: 8px">
++                        <MudText Typo="Typo.h6">
++                            @session.ChannelNumber - @maybeChannel.Map(c => c.Name).IfNone("Unknown channel")
++                        </MudText>
++                        <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined">@session.State</MudChip>
++                        @foreach (FFmpegProfileViewModel profile in maybeProfile)
++                        {
++                            <MudChip T="string" Size="Size.Small" Variant="Variant.Outlined">
++                                Profile: @profile.Name (@AccelName(configuredAccel))
++                            </MudChip>
++                        }
++                        <MudSpacer/>
++                        <MudText Typo="Typo.caption">Session started @session.StartedAt.ToLocalTime().ToString("T", CultureInfo.CurrentCulture)</MudText>
++                    </div>
++
++                    @if (!session.IsSupported)
++                    {
++                        <MudAlert Severity="Severity.Info" Dense="true">
++                            Live statistics are not available for channels using the ErsatzTV Next streaming engine.
++                        </MudAlert>
++                    }
++                    else
++                    {
++                        FFmpegTranscodePerformance current = session.Current;
++                        FFmpegTranscodePerformance latest = current ?? session.History.FirstOrDefault();
++
++                    <MudGrid Spacing="2" Class="mb-4">
++                        <MudItem xs="12" sm="6" md="3">
++                            <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
++                                <MudText Typo="Typo.caption">Buffer ahead of live</MudText>
++                                <MudText Typo="Typo.h5" Color="@BufferColor(session.BufferSeconds)">
++                                    @(session.BufferSeconds is { } buffer ? $"{buffer:0.0}s" : "-")
++                                </MudText>
++                                <MudText Typo="Typo.caption">Clients stall when this reaches 0</MudText>
++                            </MudPaper>
++                        </MudItem>
++                        <MudItem xs="12" sm="6" md="3">
++                            <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
++                                <MudText Typo="Typo.caption">Transcode speed (now / average / slowest)</MudText>
++                                @if (latest is not null)
++                                {
++                                    <MudText Typo="Typo.h5">
++                                        <MudText Inline="true" Typo="Typo.h5" Color="@SpeedColor(current?.Progress.CurrentSpeed, latest.IsWorkingAhead)">@Speed(current?.Progress.CurrentSpeed)</MudText>
++                                        <MudText Inline="true" Typo="Typo.h6"> / </MudText>
++                                        <MudText Inline="true" Typo="Typo.h6" Color="@SpeedColor(latest.Progress.Speed, latest.IsWorkingAhead)">@Speed(latest.Progress.Speed)</MudText>
++                                        <MudText Inline="true" Typo="Typo.h6"> / </MudText>
++                                        <MudText Inline="true" Typo="Typo.h6" Color="@SpeedColor(latest.Progress.SlowestSpeed, latest.IsWorkingAhead)">@Speed(latest.Progress.SlowestSpeed)</MudText>
++                                    </MudText>
++                                    <MudText Typo="Typo.caption">
++                                        @(latest.IsWorkingAhead ? "Working ahead (unthrottled), needs well above 1.0x" : "Realtime (throttled), should sit at 1.0x")
++                                    </MudText>
++                                }
++                                else
++                                {
++                                    <MudText Typo="Typo.h5">-</MudText>
++                                }
++                            </MudPaper>
++                        </MudItem>
++                        <MudItem xs="12" sm="6" md="3">
++                            <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
++                                <MudText Typo="Typo.caption">ffmpeg CPU (now / average)</MudText>
++                                <MudText Typo="Typo.h5">
++                                    @Percent(current?.CpuPercent) / @Percent(latest?.AverageCpuPercent)
++                                </MudText>
++                                <MudText Typo="Typo.caption">100% = one full core (@Environment.ProcessorCount cores available)</MudText>
++                            </MudPaper>
++                        </MudItem>
++                        <MudItem xs="12" sm="6" md="3">
++                            <MudPaper Outlined="true" Class="pa-3" Style="height: 100%">
++                                <MudText Typo="Typo.caption">Frames (dropped / duplicated)</MudText>
++                                <MudText Typo="Typo.h5">
++                                    <MudText Inline="true" Typo="Typo.h5" Color="@CountColor(latest?.Progress.DroppedFrames)">@Count(latest?.Progress.DroppedFrames)</MudText>
++                                    /
++                                    <MudText Inline="true" Typo="Typo.h5" Color="@CountColor(latest?.Progress.DuplicatedFrames)">@Count(latest?.Progress.DuplicatedFrames)</MudText>
++                                </MudText>
++                                <MudText Typo="Typo.caption">
++                                    @Count(latest?.Progress.Frame) frames at @(latest?.Progress.Fps is { } fps ? $"{fps:0.#} fps" : "-")@(string.IsNullOrWhiteSpace(latest?.Progress.Bitrate) ? "" : $", {latest.Progress.Bitrate}")
++                                </MudText>
++                            </MudPaper>
++                        </MudItem>
++                    </MudGrid>
++
++                    @if (latest is not null)
++                    {
++                        Option<MediaItemInfo> maybeInfo = GetMediaItemInfo(latest.MediaItemId);
++                        FFmpegAccelerationInfo accel = latest.Acceleration;
++
++                        <MudSimpleTable Dense="true" Bordered="false" Class="mb-4">
++                            <tbody>
++                            <tr>
++                                <td style="width: 160px"><b>@(current is null ? "Last item" : "Now transcoding")</b></td>
++                                <td>@ItemTitle(latest, maybeInfo)</td>
++                            </tr>
++                            <tr>
++                                <td><b>Source</b></td>
++                                <td>@SourceText(maybeInfo)</td>
++                            </tr>
++                            <tr>
++                                <td><b>Video decode</b></td>
++                                <td>
++                                    <MudChip T="string" Size="Size.Small" Color="@HwColor(accel.IsHardwareDecode, accel.IsVideoCopy)">@HwLabel(accel.IsHardwareDecode, accel.IsVideoCopy)</MudChip>
++                                    @DecoderText(accel)
++                                </td>
++                            </tr>
++                            <tr>
++                                <td><b>Video encode</b></td>
++                                <td>
++                                    <MudChip T="string" Size="Size.Small" Color="@HwColor(accel.IsHardwareEncode, accel.IsVideoCopy)">@HwLabel(accel.IsHardwareEncode, accel.IsVideoCopy)</MudChip>
++                                    @(accel.IsVideoCopy ? "copy (no transcode)" : accel.VideoEncoder ?? "unknown")
++                                    @if (!string.IsNullOrWhiteSpace(accel.OutputFrameRate))
++                                    {
++                                        <span> at @FrameRateText(accel.OutputFrameRate) fps</span>
++                                    }
++                                </td>
++                            </tr>
++                            <tr>
++                                <td><b>GPU filters</b></td>
++                                <td>@(accel.HardwareFilters.Count == 0 ? "none" : string.Join(", ", accel.HardwareFilters))</td>
++                            </tr>
++                            </tbody>
++                        </MudSimpleTable>
++
++                        @foreach ((Severity severity, string message) in Diagnose(configuredAccel, latest, maybeInfo))
++                        {
++                            <MudAlert Severity="@severity" Dense="true" Class="mb-2">@message</MudAlert>
++                        }
++                    }
++
++                    @if (session.History.Count > 0)
++                    {
++                        <MudText Typo="Typo.subtitle2" Class="mt-4 mb-2">Recent items</MudText>
++                        <MudSimpleTable Dense="true" Hover="true" Style="overflow-x: auto">
++                            <thead>
++                            <tr>
++                                <th>Started</th>
++                                <th>Item</th>
++                                <th>Mode</th>
++                                <th>Avg speed</th>
++                                <th>Slowest</th>
++                                <th>Dropped</th>
++                                <th>Duplicated</th>
++                                <th>Avg CPU</th>
++                                <th>Decode</th>
++                                <th>Encode</th>
++                                <th>Result</th>
++                            </tr>
++                            </thead>
++                            <tbody>
++                            @foreach (FFmpegTranscodePerformance item in session.History)
++                            {
++                                Option<MediaItemInfo> itemInfo = GetMediaItemInfo(item.MediaItemId);
++                                <tr>
++                                    <td>@item.StartedAt.ToLocalTime().ToString("T", CultureInfo.CurrentCulture)</td>
++                                    <td>@ItemTitle(item, itemInfo)</td>
++                                    <td>@(item.IsWorkingAhead ? "Work ahead" : "Realtime")</td>
++                                    <td><MudText Typo="Typo.body2" Color="@SpeedColor(item.Progress.Speed, item.IsWorkingAhead)">@Speed(item.Progress.Speed)</MudText></td>
++                                    <td><MudText Typo="Typo.body2" Color="@SpeedColor(item.Progress.SlowestSpeed, item.IsWorkingAhead)">@Speed(item.Progress.SlowestSpeed)</MudText></td>
++                                    <td><MudText Typo="Typo.body2" Color="@CountColor(item.Progress.DroppedFrames)">@Count(item.Progress.DroppedFrames)</MudText></td>
++                                    <td><MudText Typo="Typo.body2" Color="@CountColor(item.Progress.DuplicatedFrames)">@Count(item.Progress.DuplicatedFrames)</MudText></td>
++                                    <td>@Percent(item.AverageCpuPercent)</td>
++                                    <td>@HwLabel(item.Acceleration.IsHardwareDecode, item.Acceleration.IsVideoCopy)</td>
++                                    <td>@HwLabel(item.Acceleration.IsHardwareEncode, item.Acceleration.IsVideoCopy)</td>
++                                    <td>
++                                        @switch (item.Succeeded)
++                                        {
++                                            case true:
++                                                <MudIcon Icon="@Icons.Material.Filled.Check" Color="Color.Success" Size="Size.Small"/>
++                                                break;
++                                            case false:
++                                                <MudTooltip Text="ffmpeg failed; check the logs">
++                                                    <MudIcon Icon="@Icons.Material.Filled.Error" Color="Color.Error" Size="Size.Small"/>
++                                                </MudTooltip>
++                                                break;
++                                            default:
++                                                <MudTooltip Text="Stopped before finishing">
++                                                    <MudIcon Icon="@Icons.Material.Filled.Stop" Size="Size.Small"/>
++                                                </MudTooltip>
++                                                break;
++                                        }
++                                    </td>
++                                </tr>
++                            }
++                            </tbody>
++                        </MudSimpleTable>
++                    }
++                    }
++                </MudPaper>
++            }
++        </MudContainer>
++    </div>
++</MudForm>
++
++@code {
++    private readonly CancellationTokenSource _cts = new();
++    private readonly Dictionary<int, Option<MediaItemInfo>> _mediaItemInfo = [];
++    private readonly System.Collections.Generic.HashSet<int> _pendingMediaItemInfo = [];
++    private List<HlsSessionPerformanceModel> _sessions = [];
++    private List<ChannelViewModel> _channels = [];
++    private List<FFmpegProfileViewModel> _profiles = [];
++    private bool _channelsStale = true;
++
++    protected override async Task OnInitializedAsync()
++    {
++        SegmenterService.OnWorkersChanged += WorkersChanged;
++        await Refresh(_cts.Token);
++        _ = PollLoop(_cts.Token);
++    }
++
++    public void Dispose()
++    {
++        SegmenterService.OnWorkersChanged -= WorkersChanged;
++        _cts.Cancel();
++        _cts.Dispose();
++    }
++
++    private void WorkersChanged(object sender, EventArgs e) => _channelsStale = true;
++
++    private async Task PollLoop(CancellationToken cancellationToken)
++    {
++        try
++        {
++            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
++            while (await timer.WaitForNextTickAsync(cancellationToken))
++            {
++                await Refresh(cancellationToken);
++                await InvokeAsync(StateHasChanged);
++            }
++        }
++        catch (OperationCanceledException)
++        {
++            // do nothing
++        }
++    }
++
++    private async Task Refresh(CancellationToken cancellationToken)
++    {
++        if (_channelsStale)
++        {
++            _channelsStale = false;
++            _channels = await Mediator.Send(new GetAllChannels(), cancellationToken);
++            _profiles = await Mediator.Send(new GetAllFFmpegProfiles(), cancellationToken);
++        }
++
++        _sessions = SegmenterService.Workers
++            .Map(w => w.GetPerformance())
++            .OrderBy(s => decimal.TryParse(s.ChannelNumber, CultureInfo.InvariantCulture, out decimal n) ? n : decimal.MaxValue)
++            .ToList();
++
++        var mediaItemIds = _sessions
++            .SelectMany(s => s.History.Append(s.Current))
++            .Where(p => p?.MediaItemId is not null)
++            .Select(p => p.MediaItemId.Value)
++            .Distinct()
++            .Where(id => !_mediaItemInfo.ContainsKey(id) && !_pendingMediaItemInfo.Contains(id))
++            .ToList();
++
++        foreach (int mediaItemId in mediaItemIds)
++        {
++            _pendingMediaItemInfo.Add(mediaItemId);
++            try
++            {
++                Either<BaseError, MediaItemInfo> result = await Mediator.Send(new GetMediaItemInfo(mediaItemId), cancellationToken);
++                _mediaItemInfo[mediaItemId] = result.ToOption();
++            }
++            finally
++            {
++                _pendingMediaItemInfo.Remove(mediaItemId);
++            }
++        }
++    }
++
++    private Option<MediaItemInfo> GetMediaItemInfo(int? mediaItemId) =>
++        mediaItemId is { } id && _mediaItemInfo.TryGetValue(id, out Option<MediaItemInfo> info) ? info : None;
++
++    private static string ItemTitle(FFmpegTranscodePerformance performance, Option<MediaItemInfo> maybeInfo)
++    {
++        if (performance.IsSlug)
++        {
++            return "Slug (filler between items)";
++        }
++
++        return maybeInfo.Match(
++            info => info.Title,
++            () => performance.MediaItemId is { } id ? $"Media item {id}" : "Unknown item");
++    }
++
++    private static string SourceText(Option<MediaItemInfo> maybeInfo) =>
++        maybeInfo.Match(
++            info =>
++            {
++                var parts = new List<string>();
++                MediaItemInfoStream video = info.Streams.Find(s => s.Kind == MediaStreamKind.Video && s.AttachedPic != true);
++                if (video is not null)
++                {
++                    string codec = string.IsNullOrWhiteSpace(video.Profile) ? video.Codec : $"{video.Codec} ({video.Profile})";
++                    parts.Add(codec);
++                    if (!string.IsNullOrWhiteSpace(video.PixelFormat))
++                    {
++                        parts.Add(video.PixelFormat);
++                    }
++                }
++
++                if (info.Width > 0 && info.Height > 0)
++                {
++                    parts.Add($"{info.Width}x{info.Height}");
++                }
++
++                if (!string.IsNullOrWhiteSpace(info.RFrameRate))
++                {
++                    parts.Add($"{FrameRateText(info.RFrameRate)} fps");
++                }
++
++                if (info.VideoScanKind == VideoScanKind.Interlaced)
++                {
++                    parts.Add("interlaced");
++                }
++
++                return parts.Count == 0 ? "unknown" : string.Join(", ", parts);
++            },
++            () => "unknown");
++
++    private static IEnumerable<(Severity, string)> Diagnose(
++        HardwareAccelerationKind configuredAccel,
++        FFmpegTranscodePerformance performance,
++        Option<MediaItemInfo> maybeInfo)
++    {
++        FFmpegAccelerationInfo accel = performance.Acceleration;
++        FFmpegProgressSnapshot progress = performance.Progress;
++
++        if (progress.SlowestSpeed is { } slowest && slowest < 1.0 && !performance.IsWorkingAhead)
++        {
++            yield return (Severity.Warning,
++                $"ffmpeg briefly fell to {slowest:0.00}x. If this happens often or the buffer runs low, the server can't transcode this item in real time.");
++        }
++
++        if (performance.IsWorkingAhead && progress.Speed is { } speed && speed < 1.0)
++        {
++            yield return (Severity.Error,
++                $"ffmpeg is only reaching {speed:0.00}x while trying to work ahead. This item can't be transcoded fast enough for smooth playback.");
++        }
++
++        if (!accel.IsVideoCopy && configuredAccel is not HardwareAccelerationKind.None)
++        {
++            if (!accel.IsHardwareDecode)
++            {
++                yield return (Severity.Warning,
++                    $"The profile uses {AccelName(configuredAccel)}, but this item is decoded in software. Usually the hardware can't decode this source format (see Troubleshooting > Hardware).");
++            }
++
++            if (!accel.IsHardwareEncode)
++            {
++                yield return (Severity.Warning,
++                    $"The profile uses {AccelName(configuredAccel)}, but this item is encoded in software.");
++            }
++
++            if (accel.DownloadsFromHardware)
++            {
++                yield return (Severity.Info,
++                    "Frames are copied from the GPU back to the CPU for some filters (for example subtitles, watermarks or padding), which costs extra CPU.");
++            }
++        }
++
++        if (!accel.IsVideoCopy && configuredAccel is HardwareAccelerationKind.None)
++        {
++            yield return (Severity.Info, "Hardware acceleration is disabled in this channel's ffmpeg profile; all video work happens on the CPU.");
++        }
++
++        foreach (MediaItemInfo info in maybeInfo)
++        {
++            foreach (double sourceFps in FFmpegAccelerationInfo.ParseFrameRate(info.RFrameRate))
++            {
++                foreach (double outputFps in accel.OutputFrameRateValue)
++                {
++                    if (Math.Abs(sourceFps - outputFps) > 0.01)
++                    {
++                        string verb = outputFps > sourceFps ? "duplicates" : "drops";
++                        yield return (Severity.Info,
++                            $"Source is {sourceFps:0.###} fps and output is {outputFps:0.###} fps, so ffmpeg {verb} frames to convert. This can look like judder or dropped frames even though nothing is lost in transit.");
++                    }
++                }
++            }
++        }
++    }
++
++    private static string DecoderText(FFmpegAccelerationInfo accel)
++    {
++        if (accel.IsVideoCopy)
++        {
++            return "not decoded (copy)";
++        }
++
++        string decoder = string.IsNullOrWhiteSpace(accel.VideoDecoder) ? null : accel.VideoDecoder;
++        if (accel.HardwareAcceleration is not null)
++        {
++            return decoder is null ? accel.HardwareAcceleration : $"{decoder} via {accel.HardwareAcceleration}";
++        }
++
++        return decoder ?? "auto";
++    }
++
++    private static string HwLabel(bool isHardware, bool isCopy) => isCopy ? "Copy" : isHardware ? "Hardware" : "Software";
++
++    private static Color HwColor(bool isHardware, bool isCopy) => isCopy ? Color.Default : isHardware ? Color.Success : Color.Warning;
++
++    private static string AccelName(HardwareAccelerationKind kind) => kind switch
++    {
++        HardwareAccelerationKind.None => "no hardware acceleration",
++        HardwareAccelerationKind.Qsv => "Intel QSV",
++        HardwareAccelerationKind.Nvenc => "NVIDIA NVENC",
++        HardwareAccelerationKind.Vaapi => "VAAPI",
++        HardwareAccelerationKind.VideoToolbox => "VideoToolbox",
++        HardwareAccelerationKind.Amf => "AMD AMF",
++        HardwareAccelerationKind.V4l2m2m => "V4L2 M2M",
++        HardwareAccelerationKind.Rkmpp => "Rockchip MPP",
++        _ => kind.ToString()
++    };
++
++    private static string FrameRateText(string frameRate) =>
++        FFmpegAccelerationInfo.ParseFrameRate(frameRate).Match(fps => fps.ToString("0.###", CultureInfo.CurrentCulture), () => frameRate);
++
++    private static string Speed(double? speed) => speed is { } s ? $"{s:0.00}x" : "-";
++
++    private static string Percent(double? percent) => percent is { } p ? $"{p:0}%" : "-";
++
++    private static string Count(long? count) => count?.ToString("N0", CultureInfo.CurrentCulture) ?? "-";
++
++    private static Color SpeedColor(double? speed, bool isWorkingAhead) => speed switch
++    {
++        null => Color.Default,
++        { } s when isWorkingAhead && s < 1.0 => Color.Error,
++        { } s when isWorkingAhead && s <= 1.5 => Color.Warning,
++        { } s when !isWorkingAhead && s < 0.95 => Color.Error,
++        { } s when !isWorkingAhead && s < 0.99 => Color.Warning,
++        _ => Color.Success
++    };
++
++    private static Color BufferColor(double? seconds) => seconds switch
++    {
++        null => Color.Default,
++        < 3 => Color.Error,
++        < 10 => Color.Warning,
++        _ => Color.Success
++    };
++
++    private static Color CountColor(long? count) => count is > 0 ? Color.Warning : Color.Default;
++}
+diff --git a/ErsatzTV/Shared/MainLayout.razor b/ErsatzTV/Shared/MainLayout.razor
+index 532485a1..4bc0ff2f 100644
+--- a/ErsatzTV/Shared/MainLayout.razor
++++ b/ErsatzTV/Shared/MainLayout.razor
+@@ -239,6 +239,7 @@
+                             }
+                         </MudNavLink>
+                         <MudNavLink Href="system/logs">@StringLocalizer["ButtonSupportLogs"]</MudNavLink>
++                        <MudNavLink Href="system/performance">@StringLocalizer["ButtonSupportPerformance"]</MudNavLink>
+                         <MudNavLink Href="system/troubleshooting">@StringLocalizer["ButtonSupportTroubleshooting"]</MudNavLink>
+                     </ChildContent>
+                 </MudNavGroup>
+-- 
+2.54.0 (Apple Git-157)
+
