@@ -6,14 +6,19 @@ host.docker.internal. All mutating calls require header X-Update-Token matching
 UPDATE_AGENT_TOKEN in /opt/ersatztv/local/env.
 
 Endpoints:
+  GET  /                 HTML progress page (no auth — stays up while ETV is down)
   GET  /v1/sources
   GET  /v1/check?source=<id>
   GET  /v1/status
   GET  /v1/log
   POST /v1/update?source=<id>   JSON {"source":"<id>"} (query or body)
+
+API routes still require X-Update-Token. The HTML page is intentionally open on
+the LAN so you can watch a rebuild after ErsatzTV has been stopped.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import shutil
@@ -76,11 +81,17 @@ def append_log(msg: str) -> None:
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(f"[{stamp}] {msg}\n")
+        fh.flush()
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run a command, streaming stdout/stderr into the agent log as they arrive."""
+    # Force line-buffered child output when possible (dotnet/docker otherwise stall).
+    if shutil.which("stdbuf") and cmd and cmd[0] != "stdbuf":
+        cmd = ["stdbuf", "-oL", "-eL", *cmd]
     append_log("$ " + " ".join(cmd))
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -88,6 +99,7 @@ def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,
+        env=env,
     )
     assert proc.stdout is not None
     collected: list[str] = []
@@ -97,6 +109,86 @@ def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[
         append_log(text)
     returncode = proc.wait()
     return subprocess.CompletedProcess(cmd, returncode, "\n".join(collected), "")
+
+
+def tail_log(n: int = 120) -> str:
+    if not LOG_PATH.is_file():
+        return ""
+    lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-n:]) + ("\n" if lines else "")
+
+
+def progress_html() -> str:
+    with STATE_LOCK:
+        state = dict(STATE)
+    updating = bool(state.get("updating"))
+    last_ok = state.get("lastOk")
+    if updating:
+        badge = "UPDATING"
+        badge_color = "#b45309"
+    elif last_ok is True:
+        badge = "OK"
+        badge_color = "#15803d"
+    elif last_ok is False:
+        badge = "FAILED"
+        badge_color = "#b91c1c"
+    else:
+        badge = "IDLE"
+        badge_color = "#475569"
+
+    def fmt_ts(value: object) -> str:
+        if not value:
+            return "—"
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(value)))
+        except (TypeError, ValueError, OSError):
+            return str(value)
+
+    version = installed_version() or "—"
+    head = git_head(DEPLOY_DIR) or "—"
+    log_text = html.escape(tail_log(150))
+    err = html.escape(str(state.get("lastError") or ""))
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="refresh" content="2"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>ErsatzTV update</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }}
+    body {{ margin: 0; padding: 1.25rem; background: #0f172a; color: #e2e8f0; }}
+    h1 {{ font-size: 1.25rem; margin: 0 0 0.75rem; }}
+    .row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 1rem; }}
+    .badge {{ background: {badge_color}; color: #fff; padding: 0.25rem 0.6rem; border-radius: 999px; font-weight: 700; letter-spacing: 0.04em; }}
+    .meta {{ color: #94a3b8; font-size: 0.9rem; }}
+    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 1rem; }}
+    pre {{ margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 70vh; overflow: auto; }}
+    .err {{ color: #fca5a5; margin-top: 0.75rem; }}
+  </style>
+</head>
+<body>
+  <h1>ErsatzTV update agent</h1>
+  <div class="row">
+    <span class="badge">{badge}</span>
+    <span class="meta">source: {html.escape(str(state.get("lastSource") or "—"))}</span>
+    <span class="meta">started: {fmt_ts(state.get("lastStarted"))}</span>
+    <span class="meta">finished: {fmt_ts(state.get("lastFinished"))}</span>
+  </div>
+  <div class="row meta">
+    <span>installed: {html.escape(version)}</span>
+    <span>deploy HEAD: {html.escape(head[:12] if head != "—" else head)}</span>
+    <span>auto-refresh 2s · this page stays up while ErsatzTV is stopped</span>
+  </div>
+  {"<div class='err'>last error: " + err + "</div>" if err else ""}
+  <div class="card"><pre id="log">{log_text}</pre></div>
+  <script>
+    const log = document.getElementById('log');
+    if (log) log.scrollTop = log.scrollHeight;
+  </script>
+</body>
+</html>
+"""
 
 
 def git_head(repo: Path) -> str | None:
@@ -340,6 +432,17 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
 
+        # Public progress UI — independent of the ErsatzTV container.
+        if path in ("/", "/progress", "/status"):
+            body = progress_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         if path == "/v1/sources":
             if not self._authorized():
                 return self._json(401, {"error": "unauthorized"})
@@ -381,11 +484,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/log":
             if not self._authorized():
                 return self._json(401, {"error": "unauthorized"})
-            if not LOG_PATH.is_file():
-                return self._text(200, "")
-            # Last ~200 lines
-            lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
-            return self._text(200, "\n".join(lines[-200:]) + ("\n" if lines else ""))
+            return self._text(200, tail_log(200))
 
         return self._json(404, {"error": "not found"})
 
@@ -417,7 +516,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(202, {"started": True, "source": source_id})
 
     def log_message(self, fmt: str, *args) -> None:
-        append_log("http " + (fmt % args))
+        # Don't spam the progress log with Health Check / browser polls.
+        msg = fmt % args
+        if any(x in msg for x in ("/v1/status", "/v1/check", "/v1/log", "/v1/sources", "GET / ", "GET /progress", "GET /status")):
+            return
+        append_log("http " + msg)
 
 
 def main() -> None:
