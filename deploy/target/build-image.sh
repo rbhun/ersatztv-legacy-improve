@@ -143,9 +143,11 @@ stop_ersatztv_for_build() {
         echo "==> stopping ersatztv for low-memory publish"
         docker compose -f "${ETV_DIR}/docker-compose.yml" stop >/dev/null 2>&1 || true
     fi
-    docker ps --format '{{.Names}}' | grep -E '^ersatztv' | while read -r name; do
+    # grep exits 1 when nothing matches — must not trip set -o pipefail.
+    while read -r name; do
+        [ -n "$name" ] || continue
         docker stop "$name" >/dev/null 2>&1 || true
-    done
+    done < <(docker ps --format '{{.Names}}' | grep -E '^ersatztv' || true)
 }
 
 publish_one() {
