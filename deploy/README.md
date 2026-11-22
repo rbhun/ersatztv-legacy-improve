@@ -49,6 +49,11 @@ ersatztv-update --image      # image only
 ersatztv-update --no-pull    # use the deploy checkout already on disk
 ```
 
+Or from the ErsatzTV UI: **Support → Health Checks → Updates**. The host runs
+`ersatztv-update-agent` (systemd). The page polls every 10 seconds, lets you pick a
+repo/branch from `UPDATE_SOURCES`, and the Update button backs up `/opt/ersatztv/local`,
+runs the update, restores local overlay, and shows a live log.
+
 ## Local overlay rules
 
 Defaults come from `ersatztv/*.yml` in this public repo.

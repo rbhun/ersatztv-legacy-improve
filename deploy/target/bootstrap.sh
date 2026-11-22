@@ -59,7 +59,7 @@ else
     echo "    keeping existing ${ETV_DIR}/local/env"
 fi
 
-chmod +x "${DEPLOY_DIR}/deploy/target/"*.sh
+chmod +x "${DEPLOY_DIR}/deploy/target/"*.sh "${DEPLOY_DIR}/deploy/target/update-agent.py"
 
 cat > /usr/local/bin/ersatztv-update <<EOF
 #!/bin/sh
@@ -67,14 +67,23 @@ exec ${DEPLOY_DIR}/deploy/target/update.sh "\$@"
 EOF
 chmod 755 /usr/local/bin/ersatztv-update
 
+# Health Check update agent — lets the UI poll GitHub and trigger updates.
+install -m 644 "${DEPLOY_DIR}/deploy/target/ersatztv-update-agent.service" \
+    /etc/systemd/system/ersatztv-update-agent.service
+systemctl daemon-reload
+systemctl enable --now ersatztv-update-agent
+
 cat <<EOF
 
 Bootstrap complete.
 
 Next:
   1. Review ${ETV_DIR}/local/env
+     - set UPDATE_AGENT_TOKEN to a long random string
+     - adjust UPDATE_SOURCES if you want extra repos/branches in the UI
   2. Run:  ersatztv-update
      (pulls this repo, clones upstream + applies patches/, builds image, applies schedules)
+  3. Open ErsatzTV -> Support -> Health Checks for the Update panel
 
 Local schedule overrides go in ${ETV_DIR}/local/schedules/ (same filenames as the public
 ersatztv/*.yml files). Anything there wins over the public defaults on every update.

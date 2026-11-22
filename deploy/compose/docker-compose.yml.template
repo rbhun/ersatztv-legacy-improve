@@ -7,6 +7,10 @@ services:
     container_name: ersatztv
     environment:
       - TZ=${TZ}
+      - ETV_UPDATE_AGENT_URL=${UPDATE_AGENT_URL}
+      - ETV_UPDATE_AGENT_TOKEN=${UPDATE_AGENT_TOKEN}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${ETV_PORT}:${ETV_PORT}"
     volumes:
