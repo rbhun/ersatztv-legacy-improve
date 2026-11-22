@@ -134,9 +134,6 @@ DOTNET_PUBLISH_FLAGS=(
     /p:InformationalVersion="$VERSION"
 )
 
-# Cap container RAM but allow unlimited swap so csc can page instead of SIGKILL.
-DOCKER_MEM_LIMIT="${DOCKER_DOTNET_MEMORY:-3200m}"
-
 stop_ersatztv_for_build() {
     # Free a few hundred MB while compiling; restart happens in update.sh.
     if [ -f "${ETV_DIR}/docker-compose.yml" ]; then
@@ -150,6 +147,15 @@ stop_ersatztv_for_build() {
     done < <(docker ps --format '{{.Names}}' | grep -E '^ersatztv' || true)
 }
 
+reclaim_disk() {
+    echo "==> reclaiming disk"
+    if [ -d "$WORKDIR/src" ]; then
+        find "$WORKDIR/src" \( -type d -name obj -o -type d -name bin \) -prune -exec rm -rf {} + 2>/dev/null || true
+    fi
+    docker builder prune -f >/dev/null 2>&1 || true
+    docker image prune -f >/dev/null 2>&1 || true
+}
+
 publish_one() {
     proj=$1
     [ -f "$WORKDIR/src/$proj" ] || die "missing $proj after patches"
@@ -161,12 +167,12 @@ publish_one() {
         dotnet publish "$WORKDIR/src/$proj" "${DOTNET_PUBLISH_FLAGS[@]}" \
             -o "$WORKDIR/ctx/app"
     else
-        echo "    (dotnet SDK via ${DOTNET_SDK_IMAGE}; low-mem flags + swap)"
-        # Source must be writable — NuGet writes obj/ under the project tree.
+        # Do NOT set --memory: a cgroup cap makes .NET throw OutOfMemoryException
+        # before the kernel can page to the host swap (seen as System.OutOfMemoryException
+        # on Infrastructure.Sqlite with --memory=3200m on a 4Gi LXC).
+        echo "    (dotnet SDK via ${DOTNET_SDK_IMAGE}; no cgroup memory cap)"
         mkdir -p "${CACHE}/nuget"
         docker run --rm \
-            --memory="$DOCKER_MEM_LIMIT" \
-            --memory-swap=-1 \
             -v "$WORKDIR/src:/src" \
             -v "$WORKDIR/ctx/app:/out" \
             -v "${CACHE}/nuget:/root/.nuget/packages" \
@@ -179,12 +185,15 @@ publish_one() {
 }
 
 stop_ersatztv_for_build
+reclaim_disk
 echo "==> publishing Scanner + ErsatzTV for linux-x64"
 publish_one ErsatzTV.Scanner/ErsatzTV.Scanner.csproj
+reclaim_disk
 publish_one ErsatzTV/ErsatzTV.csproj
+rm -rf "$WORKDIR/src"
 
-if [ -d "$WORKDIR/src/scripts/scripted-schedules" ]; then
-    cp -R "$WORKDIR/src/scripts/scripted-schedules" "$WORKDIR/ctx/scripted-schedules"
+if [ -d "$SRC_ETV/scripts/scripted-schedules" ]; then
+    cp -R "$SRC_ETV/scripts/scripted-schedules" "$WORKDIR/ctx/scripted-schedules"
 else
     mkdir -p "$WORKDIR/ctx/scripted-schedules"
 fi
@@ -203,6 +212,7 @@ else
     id=$(docker create ersatztv-next-build:improve)
     docker cp "$id:/out/ersatztv-channel" "$CHANNEL_BIN"
     docker rm "$id" >/dev/null
+    docker rmi ersatztv-next-build:improve >/dev/null 2>&1 || true
     chmod +x "$CHANNEL_BIN"
     echo "$NEXT_SHA" > "$CHANNEL_SHA_FILE"
 fi
@@ -218,6 +228,7 @@ DOCKER_BUILDKIT=1 docker build \
 echo "$STATE" > "$CACHE/last-state"
 echo "$VERSION" > "$CACHE/last-version"
 rm -rf "$WORKDIR"
+reclaim_disk
 
 echo
 echo "done: ${ETV_IMAGE} (also ersatztv:${VERSION})"
