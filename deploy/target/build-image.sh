@@ -70,6 +70,10 @@ apply_patches() {
         echo "==> no ${label} patches"
         return
     fi
+    # git am needs a committer; set a local (repo-only) identity so bare LXC
+    # hosts without user.name / user.email still apply patches.
+    git -C "$dir" config user.email "builder@ersatztv.local"
+    git -C "$dir" config user.name "ErsatzTV Improve Builder"
     echo "==> applying ${#patches[@]} ${label} patch(es)"
     git -C "$dir" am --3way "${patches[@]}"
 }
