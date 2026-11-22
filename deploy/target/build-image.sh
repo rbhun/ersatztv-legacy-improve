@@ -127,8 +127,9 @@ publish_one() {
             /p:DebugType=Embedded /p:InformationalVersion="$VERSION"
     else
         echo "    (dotnet SDK via ${DOTNET_SDK_IMAGE})"
+        # Source must be writable — NuGet writes obj/ under the project tree.
         docker run --rm \
-            -v "$WORKDIR/src:/src:ro" \
+            -v "$WORKDIR/src:/src" \
             -v "$WORKDIR/ctx/app:/out" \
             -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
             "$DOTNET_SDK_IMAGE" \
