@@ -178,13 +178,29 @@ publish_one() {
     fi
 }
 
+reclaim_disk() {
+    echo "==> reclaiming disk before/during build"
+    # Intermediate compile outputs are huge; keep published /out only.
+    if [ -d "$WORKDIR/src" ]; then
+        find "$WORKDIR/src" \( -type d -name obj -o -type d -name bin \) -prune -exec rm -rf {} + 2>/dev/null || true
+    fi
+    docker builder prune -f >/dev/null 2>&1 || true
+    docker image prune -f >/dev/null 2>&1 || true
+    # Drop failed/partial SDK containers if any lingered.
+    docker ps -aq --filter "ancestor=${DOTNET_SDK_IMAGE}" | xargs -r docker rm -f >/dev/null 2>&1 || true
+}
+
 stop_ersatztv_for_build
+reclaim_disk
 echo "==> publishing Scanner + ErsatzTV for linux-x64"
 publish_one ErsatzTV.Scanner/ErsatzTV.Scanner.csproj
+reclaim_disk
 publish_one ErsatzTV/ErsatzTV.csproj
+# Drop the extracted source tree (obj/bin + sources) — keep only /out artifacts.
+rm -rf "$WORKDIR/src"
 
-if [ -d "$WORKDIR/src/scripts/scripted-schedules" ]; then
-    cp -R "$WORKDIR/src/scripts/scripted-schedules" "$WORKDIR/ctx/scripted-schedules"
+if [ -d "$SRC_ETV/scripts/scripted-schedules" ]; then
+    cp -R "$SRC_ETV/scripts/scripted-schedules" "$WORKDIR/ctx/scripted-schedules"
 else
     mkdir -p "$WORKDIR/ctx/scripted-schedules"
 fi
@@ -203,6 +219,7 @@ else
     id=$(docker create ersatztv-next-build:improve)
     docker cp "$id:/out/ersatztv-channel" "$CHANNEL_BIN"
     docker rm "$id" >/dev/null
+    docker rmi ersatztv-next-build:improve >/dev/null 2>&1 || true
     chmod +x "$CHANNEL_BIN"
     echo "$NEXT_SHA" > "$CHANNEL_SHA_FILE"
 fi
@@ -218,6 +235,7 @@ DOCKER_BUILDKIT=1 docker build \
 echo "$STATE" > "$CACHE/last-state"
 echo "$VERSION" > "$CACHE/last-version"
 rm -rf "$WORKDIR"
+reclaim_disk
 
 echo
 echo "done: ${ETV_IMAGE} (also ersatztv:${VERSION})"
