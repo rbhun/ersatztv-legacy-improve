@@ -116,7 +116,7 @@ if [ -f "$WORKDIR/src/ErsatzTV/ErsatzTV.csproj" ]; then
         || sed -i '' '/Scanner/d' "$WORKDIR/src/ErsatzTV/ErsatzTV.csproj"
 fi
 
-# Roslyn/csc exit 137 = SIGKILL (OOM). Keep MSBuild single-threaded on small LXCs.
+# Roslyn/csc exit 137 = SIGKILL (OOM). Keep MSBuild lean on small LXCs.
 DOTNET_PUBLISH_FLAGS=(
     -c release
     -r linux-x64
@@ -126,9 +126,27 @@ DOTNET_PUBLISH_FLAGS=(
     -m:1
     /p:BuildInParallel=false
     /p:UseSharedCompilation=false
-    /p:DebugType=Embedded
+    /p:RunAnalyzers=false
+    /p:RunAnalyzersDuringBuild=false
+    /p:EnableNETAnalyzers=false
+    /p:DebugType=none
+    /p:DebugSymbols=false
     /p:InformationalVersion="$VERSION"
 )
+
+# Cap container RAM but allow unlimited swap so csc can page instead of SIGKILL.
+DOCKER_MEM_LIMIT="${DOCKER_DOTNET_MEMORY:-3200m}"
+
+stop_ersatztv_for_build() {
+    # Free a few hundred MB while compiling; restart happens in update.sh.
+    if [ -f "${ETV_DIR}/docker-compose.yml" ]; then
+        echo "==> stopping ersatztv for low-memory publish"
+        docker compose -f "${ETV_DIR}/docker-compose.yml" stop >/dev/null 2>&1 || true
+    fi
+    docker ps --format '{{.Names}}' | grep -E '^ersatztv' | while read -r name; do
+        docker stop "$name" >/dev/null 2>&1 || true
+    done
+}
 
 publish_one() {
     proj=$1
@@ -137,23 +155,28 @@ publish_one() {
         export PATH="${HOME}/.dotnet:${PATH:-}"
         [ -d "${HOME}/.dotnet" ] && export DOTNET_ROOT="${HOME}/.dotnet"
         export DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1
+        export MSBUILDDISABLENODEREUSE=1
         dotnet publish "$WORKDIR/src/$proj" "${DOTNET_PUBLISH_FLAGS[@]}" \
             -o "$WORKDIR/ctx/app"
     else
-        echo "    (dotnet SDK via ${DOTNET_SDK_IMAGE}; single-threaded to avoid OOM)"
+        echo "    (dotnet SDK via ${DOTNET_SDK_IMAGE}; low-mem flags + swap)"
         # Source must be writable — NuGet writes obj/ under the project tree.
         mkdir -p "${CACHE}/nuget"
         docker run --rm \
+            --memory="$DOCKER_MEM_LIMIT" \
+            --memory-swap=-1 \
             -v "$WORKDIR/src:/src" \
             -v "$WORKDIR/ctx/app:/out" \
             -v "${CACHE}/nuget:/root/.nuget/packages" \
             -e DOTNET_CLI_TELEMETRY_OPTOUT=1 \
             -e DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1 \
+            -e MSBUILDDISABLENODEREUSE=1 \
             "$DOTNET_SDK_IMAGE" \
             dotnet publish "/src/$proj" "${DOTNET_PUBLISH_FLAGS[@]}" -o /out
     fi
 }
 
+stop_ersatztv_for_build
 echo "==> publishing Scanner + ErsatzTV for linux-x64"
 publish_one ErsatzTV.Scanner/ErsatzTV.Scanner.csproj
 publish_one ErsatzTV/ErsatzTV.csproj
