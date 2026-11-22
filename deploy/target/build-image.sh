@@ -232,4 +232,5 @@ reclaim_disk
 
 echo
 echo "done: ${ETV_IMAGE} (also ersatztv:${VERSION})"
-docker image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}' | head -5
+# Avoid `... | head` under pipefail — head closes early → docker SIGPIPE → exit 141.
+docker image ls --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}' --filter "reference=${ETV_IMAGE}" --filter "reference=ersatztv:${VERSION}"
